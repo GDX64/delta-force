@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use arrow_array::RecordBatch;
 use futures::{AsyncBufRead, AsyncBufReadExt, Stream, StreamExt, TryStreamExt, stream::BoxStream};
-use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
+use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, path::Path};
 use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
 
@@ -74,7 +74,10 @@ impl Table {
         let next_version = current_version.map(|v| v + 1).unwrap_or(0);
         let file_name = Self::file_name(next_version);
         let path = Path::from("_delta_log").join(file_name);
-        let _result = self.store.put(&path, file.into()).await?;
+        let _result = self
+            .store
+            .put_opts(&path, file.into(), PutMode::Create.into())
+            .await?;
         return Ok(next_version);
     }
 
@@ -93,7 +96,9 @@ impl Table {
         };
 
         let path = Path::from(add.path.clone());
-        self.store.put(&path, buffer.into()).await?;
+        self.store
+            .put_opts(&path, buffer.into(), PutMode::Create.into())
+            .await?;
         let v = self.commit([Action::Add(add)]).await?;
         return Ok(v);
     }
