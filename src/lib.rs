@@ -1,5 +1,10 @@
-use futures::{AsyncBufReadExt, StreamExt, TryStreamExt};
-use object_store::{ObjectStore, ObjectStoreExt, path::Path};
+use std::collections::HashSet;
+
+use futures::{
+    AsyncBufRead, AsyncBufReadExt, StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
+};
+use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use serde::{Deserialize, Serialize};
 
 /// A Delta table: a directory of data files plus a `_delta_log/` of JSON
@@ -17,6 +22,15 @@ impl Table {
     /// Nothing is read yet; this only binds the table to its storage.
     pub fn new(store: Box<dyn ObjectStore>) -> Self {
         Self { store }
+    }
+
+    pub fn commit_list(&self) -> BoxStream<ObjectMeta> {
+        let path = Path::from("_delta_log");
+        let s = self
+            .store
+            .list(Some(&path))
+            .filter_map(async |meta| meta.ok());
+        return Box::pin(s);
     }
 
     /// The latest committed version, or `None` if the table has no commits.
@@ -55,6 +69,47 @@ impl Table {
             .await;
 
         return Ok(lines);
+    }
+
+    pub async fn files(&self) -> anyhow::Result<Vec<String>> {
+        let files = self
+            .commit_list()
+            .flat_map(|file| {
+                return self.read_commit_file(&file.location.to_string());
+            })
+            .fold(HashSet::<String>::new(), async |mut files, a| {
+                match a {
+                    Action::Add(add) => {
+                        files.insert(add.path);
+                    }
+                    Action::Remove(remove) => {
+                        files.remove(&remove.path);
+                    }
+                    _ => {}
+                };
+                return files;
+            })
+            .await;
+
+        return Ok(files.into_iter().collect());
+    }
+
+    fn read_commit_file(&self, path: &str) -> BoxStream<Action> {
+        let path = Path::from(path);
+        let s = stream::once(async move {
+            let r = self.store.get(&path).await.expect("result");
+            let reader = into_buf_reader(r);
+            let s = reader.lines().filter_map(async |s| {
+                let Ok(s) = s else { return None };
+                let Ok(action) = serde_json::from_str::<Action>(&s) else {
+                    return None;
+                };
+                return Some(action);
+            });
+            return s;
+        })
+        .flatten();
+        return Box::pin(s);
     }
 }
 
@@ -95,6 +150,18 @@ pub struct Add {
 pub struct Remove {
     pub path: String,
     pub data_change: bool,
+}
+
+/// Adapt an object-store download into an async, buffered reader.
+///
+/// Chunks are pulled from the store as the reader is polled, so the whole
+/// object is never held in memory. Call `.lines()` (from `AsyncBufReadExt`)
+/// on the result to get a stream of lines, even when a line spans chunks.
+fn into_buf_reader(result: GetResult) -> impl AsyncBufRead + Unpin {
+    result
+        .into_stream()
+        .map_err(std::io::Error::other)
+        .into_async_read()
 }
 
 /// Parse `<version>.json` from a log file path. `None` for anything else.
