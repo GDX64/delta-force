@@ -150,19 +150,6 @@ async fn commit_writes_the_next_version() {
 }
 
 #[tokio::test]
-async fn commit_at_fails_if_the_version_already_exists() {
-    let storage = InMemory::new();
-    put_actions(&storage, 0, &[&add("a.parquet")]).await;
-    let table = Table::new(Box::new(storage));
-
-    // Someone else already committed version 0: we must lose, not overwrite.
-    // let result = table.commit_at(0, vec![add_action("b.parquet")]).await;
-
-    // assert!(result.is_err());
-    // assert_eq!(table.files().await.unwrap(), vec!["a.parquet"]);
-}
-
-#[tokio::test]
 async fn version_ignores_files_that_are_not_commits() {
     let storage = InMemory::new();
     put_commit(&storage, 0).await;
