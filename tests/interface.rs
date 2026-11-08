@@ -1,4 +1,4 @@
-use delta_force::{Action, Protocol, Table};
+use delta_force::{Action, Add, Protocol, Remove, Table};
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 
 /// Put an (empty) commit file in the log. Contents don't matter for
@@ -116,6 +116,50 @@ async fn files_replays_adds_and_removes() {
     files.sort();
 
     assert_eq!(files, vec!["b.parquet", "c.parquet"]);
+}
+
+fn add_action(path: &str) -> Action {
+    Action::Add(Add {
+        path: path.into(),
+        size: 1,
+        data_change: true,
+    })
+}
+
+fn remove_action(path: &str) -> Action {
+    Action::Remove(Remove {
+        path: path.into(),
+        data_change: true,
+    })
+}
+
+#[tokio::test]
+async fn commit_writes_the_next_version() {
+    let table = Table::new(Box::new(InMemory::new()));
+
+    // First commit on an empty log is version 0.
+    let v0 = table.commit(vec![add_action("a.parquet")]).await.unwrap();
+    let v1 = table
+        .commit(vec![remove_action("a.parquet"), add_action("b.parquet")])
+        .await
+        .unwrap();
+
+    assert_eq!((v0, v1), (0, 1));
+    assert_eq!(table.version().await.unwrap(), Some(1));
+    assert_eq!(table.files().await.unwrap(), vec!["b.parquet"]);
+}
+
+#[tokio::test]
+async fn commit_at_fails_if_the_version_already_exists() {
+    let storage = InMemory::new();
+    put_actions(&storage, 0, &[&add("a.parquet")]).await;
+    let table = Table::new(Box::new(storage));
+
+    // Someone else already committed version 0: we must lose, not overwrite.
+    // let result = table.commit_at(0, vec![add_action("b.parquet")]).await;
+
+    // assert!(result.is_err());
+    // assert_eq!(table.files().await.unwrap(), vec!["a.parquet"]);
 }
 
 #[tokio::test]

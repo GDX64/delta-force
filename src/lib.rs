@@ -1,3 +1,4 @@
+#![feature(iterator_try_collect)]
 use std::collections::HashSet;
 
 use futures::{AsyncBufRead, AsyncBufReadExt, Stream, StreamExt, TryStreamExt, stream::BoxStream};
@@ -48,11 +49,31 @@ impl Table {
             .map_err(Into::into)
     }
 
+    fn file_name(version: u64) -> String {
+        return format!("{:0>20}.json", version.to_string());
+    }
+
     pub async fn read_commit(&self, i: usize) -> anyhow::Result<Vec<Action>> {
         let path = Path::from("_delta_log");
-        let path = path.join(format!("{:0>20}.json", i.to_string()));
+        let path = path.join(Self::file_name(i as u64));
         let lines: Vec<Action> = self.read_commit_file(path).await?.collect().await;
         Ok(lines)
+    }
+
+    pub async fn commit(&self, action: Vec<Action>) -> anyhow::Result<u64> {
+        let current_version = self.version().await?;
+        let file = action
+            .into_iter()
+            .map(|v| {
+                return serde_json::to_string(&v);
+            })
+            .try_collect::<Vec<String>>()?
+            .join("\n");
+        let next_version = current_version.map(|v| v + 1).unwrap_or(0);
+        let file_name = Self::file_name(next_version);
+        let path = Path::from("_delta_log").join(file_name);
+        let _result = self.store.put(&path, file.into()).await?;
+        return Ok(next_version);
     }
 
     pub async fn files(&self) -> anyhow::Result<Vec<String>> {
