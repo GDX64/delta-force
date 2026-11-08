@@ -64,19 +64,37 @@ pub enum Action {
     Protocol(Protocol),
     #[serde(rename = "metaData")]
     Metadata(Metadata),
+    #[serde(rename = "add")]
+    Add(Add),
+    #[serde(rename = "remove")]
+    Remove(Remove),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Protocol {
-    pub min_reader_version: u32,
-    pub min_writer_version: u32,
+    pub min_reader_version: u64,
+    pub min_writer_version: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
     pub id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Add {
+    pub path: String,
+    pub size: u64,
+    pub data_change: bool,
+}
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Remove {
+    pub path: String,
+    pub data_change: bool,
 }
 
 /// Parse `<version>.json` from a log file path. `None` for anything else.
