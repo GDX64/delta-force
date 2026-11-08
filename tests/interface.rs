@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use delta_force::{Action, Add, Protocol, Remove, Table};
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Put an (empty) commit file in the log. Contents don't matter for
 /// `version()`, only the file name does.
@@ -147,6 +151,39 @@ async fn commit_writes_the_next_version() {
     assert_eq!((v0, v1), (0, 1));
     assert_eq!(table.version().await.unwrap(), Some(1));
     assert_eq!(table.files().await.unwrap(), vec!["b.parquet"]);
+}
+
+#[tokio::test]
+async fn write_stores_a_parquet_file_and_commits_it() {
+    // Keep a handle on the store so the test can look inside it afterwards.
+    let store = Arc::new(InMemory::new());
+    let table = Table::new(Box::new(store.clone()));
+    let batch =
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef)])
+            .unwrap();
+
+    let version = table.write(batch.clone()).await.unwrap();
+
+    // The write is a commit: first one on an empty log is version 0...
+    assert_eq!(version, 0);
+    // ...which adds exactly one data file to the table.
+    let files = table.files().await.unwrap();
+    assert_eq!(files.len(), 1);
+
+    // That file is real Parquet that reads back to what we wrote.
+    let bytes = store
+        .get(&Path::from(files[0].as_str()))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(reader.next().unwrap().unwrap(), batch);
+    assert!(reader.next().is_none());
 }
 
 #[tokio::test]

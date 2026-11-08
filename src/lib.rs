@@ -1,8 +1,10 @@
 #![feature(iterator_try_collect)]
 use std::collections::HashSet;
 
+use arrow_array::RecordBatch;
 use futures::{AsyncBufRead, AsyncBufReadExt, Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
+use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
 
 /// A Delta table: a directory of data files plus a `_delta_log/` of JSON
@@ -60,7 +62,7 @@ impl Table {
         Ok(lines)
     }
 
-    pub async fn commit(&self, action: Vec<Action>) -> anyhow::Result<u64> {
+    pub async fn commit(&self, action: impl IntoIterator<Item = Action>) -> anyhow::Result<u64> {
         let current_version = self.version().await?;
         let file = action
             .into_iter()
@@ -74,6 +76,26 @@ impl Table {
         let path = Path::from("_delta_log").join(file_name);
         let _result = self.store.put(&path, file.into()).await?;
         return Ok(next_version);
+    }
+
+    pub async fn write(&self, batch: RecordBatch) -> anyhow::Result<u64> {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None)?;
+            writer.write(&batch)?;
+            writer.close()?;
+        }
+        let parquet_name = format!("{}.parquet", uuid::Uuid::new_v4().to_string());
+        let add = Add {
+            data_change: true,
+            path: parquet_name,
+            size: buffer.len() as u64,
+        };
+
+        let path = Path::from(add.path.clone());
+        self.store.put(&path, buffer.into()).await?;
+        let v = self.commit([Action::Add(add)]).await?;
+        return Ok(v);
     }
 
     pub async fn files(&self) -> anyhow::Result<Vec<String>> {
