@@ -24,7 +24,7 @@ impl Table {
         Self { store }
     }
 
-    pub fn commit_list(&self) -> BoxStream<ObjectMeta> {
+    pub fn commit_list<'a>(&'a self) -> BoxStream<'a, ObjectMeta> {
         let path = Path::from("_delta_log");
         let s = self
             .store
@@ -54,20 +54,7 @@ impl Table {
     pub async fn read_commit(&self, i: usize) -> anyhow::Result<Vec<Action>> {
         let path = Path::from("_delta_log");
         let path = path.join(format!("{:0>20}.json", i.to_string()));
-        let file = self.store.get(&path).await?;
-        let bytes = file.bytes().await?;
-        let lines = bytes
-            .lines()
-            .filter_map(async |s| {
-                let Ok(s) = s else { return None };
-                let Ok(action) = serde_json::from_str::<Action>(&s) else {
-                    return None;
-                };
-                return Some(action);
-            })
-            .collect()
-            .await;
-
+        let lines = self.read_commit_file(&path.to_string()).collect().await;
         return Ok(lines);
     }
 
@@ -94,10 +81,10 @@ impl Table {
         return Ok(files.into_iter().collect());
     }
 
-    fn read_commit_file(&self, path: &str) -> BoxStream<Action> {
+    fn read_commit_file<'a>(&'a self, path: &str) -> BoxStream<'a, Action> {
         let path = Path::from(path);
         let s = stream::once(async move {
-            let r = self.store.get(&path).await.expect("result");
+            let r = self.store.get(&path).await.expect("result failed");
             let reader = into_buf_reader(r);
             let s = reader.lines().filter_map(async |s| {
                 let Ok(s) = s else { return None };
