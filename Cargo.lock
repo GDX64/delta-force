@@ -96,6 +96,7 @@ name = "delta-force"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures",
  "object_store",
  "serde",

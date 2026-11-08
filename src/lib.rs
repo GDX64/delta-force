@@ -1,5 +1,6 @@
-use futures::TryStreamExt;
-use object_store::{ObjectStore, path::Path};
+use futures::{AsyncBufReadExt, StreamExt, TryStreamExt};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path};
+use serde::{Deserialize, Serialize};
 
 /// A Delta table: a directory of data files plus a `_delta_log/` of JSON
 /// commits describing which files make up the table at each version.
@@ -35,6 +36,47 @@ impl Table {
             .await
             .map_err(Into::into)
     }
+
+    pub async fn read_commit(&self, i: usize) -> anyhow::Result<Vec<Action>> {
+        let path = Path::from("_delta_log");
+        let path = path.join(format!("{:0>20}.json", i.to_string()));
+        let file = self.store.get(&path).await?;
+        let bytes = file.bytes().await?;
+        let lines = bytes
+            .lines()
+            .filter_map(async |s| {
+                let Ok(s) = s else { return None };
+                let Ok(action) = serde_json::from_str::<Action>(&s) else {
+                    return None;
+                };
+                return Some(action);
+            })
+            .collect()
+            .await;
+
+        return Ok(lines);
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Action {
+    #[serde(rename = "protocol")]
+    Protocol(Protocol),
+    #[serde(rename = "metaData")]
+    Metadata(Metadata),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Protocol {
+    pub min_reader_version: u32,
+    pub min_writer_version: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Metadata {
+    pub id: String,
 }
 
 /// Parse `<version>.json` from a log file path. `None` for anything else.

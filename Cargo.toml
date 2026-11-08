@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+bytes = "1.12.1"
 futures = "0.3.34"
 object_store = "0.14.2"
 serde = { version = "1.0.229", features = ["derive"] }
