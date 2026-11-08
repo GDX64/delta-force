@@ -1,6 +1,5 @@
-use anyhow::anyhow;
-use futures::StreamExt;
-use object_store::{ObjectMeta, ObjectStore, path::Path};
+use futures::TryStreamExt;
+use object_store::{ObjectStore, path::Path};
 
 /// A Delta table: a directory of data files plus a `_delta_log/` of JSON
 /// commits describing which files make up the table at each version.
@@ -19,34 +18,26 @@ impl Table {
         Self { store }
     }
 
-    pub async fn version(&self) -> anyhow::Result<Option<u32>> {
-        let path = Path::from("/_delta_log");
-        let last: Option<ObjectMeta> = self
-            .store
+    /// The latest committed version, or `None` if the table has no commits.
+    ///
+    /// Only files named `<20-digit version>.json` count as commits;
+    /// checkpoints, `_last_checkpoint`, crc files etc. are ignored.
+    pub async fn version(&self) -> anyhow::Result<Option<u64>> {
+        let path = Path::from("_delta_log");
+        self.store
             .list(Some(&path))
-            .filter_map(async |v| {
-                return v.ok();
+            .try_fold(None, async |latest: Option<u64>, meta| {
+                Ok(match commit_version(&meta.location) {
+                    Some(v) => latest.max(Some(v)),
+                    None => latest,
+                })
             })
-            .fold(None, async |acc: Option<ObjectMeta>, v| {
-                let Some(acc) = acc else {
-                    return Some(v);
-                };
-                if acc.location.filename() < v.location.filename() {
-                    return Some(v);
-                }
-                return Some(acc);
-            })
-            .await;
-
-        let Some(last) = last else { return Ok(None) };
-        let (version, _) = last
-            .location
-            .filename()
-            .ok_or(anyhow!("file must have a name"))?
-            .split_once(".")
-            .ok_or(anyhow!("file must have extension"))?;
-        let version = version.parse::<u32>()?;
-
-        return Ok(Some(version));
+            .await
+            .map_err(Into::into)
     }
+}
+
+/// Parse `<version>.json` from a log file path. `None` for anything else.
+fn commit_version(path: &Path) -> Option<u64> {
+    path.filename()?.strip_suffix(".json")?.parse().ok()
 }

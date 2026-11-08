@@ -26,3 +26,22 @@ async fn version_is_the_latest_commit() {
 
     assert_eq!(table.version().await.unwrap(), Some(2));
 }
+
+#[tokio::test]
+async fn version_ignores_files_that_are_not_commits() {
+    let storage = InMemory::new();
+    put_commit(&storage, 0).await;
+    // Data files and non-commit log files live alongside the commits.
+    for name in [
+        "part-0000.parquet",
+        "_delta_log/_last_checkpoint",
+        "_delta_log/00000000000000000010.checkpoint.parquet",
+        "_delta_log/00000000000000000000.crc",
+    ] {
+        storage.put(&Path::from(name), "".into()).await.unwrap();
+    }
+
+    let table = Table::new(Box::new(storage));
+
+    assert_eq!(table.version().await.unwrap(), Some(0));
+}
