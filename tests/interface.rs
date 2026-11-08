@@ -1,5 +1,5 @@
 use delta_force::Table;
-use object_store::{memory::InMemory, path::Path};
+use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 
 /// Put an (empty) commit file in the log. Contents don't matter for
 /// `version()`, only the file name does.
