@@ -1,9 +1,6 @@
 use std::collections::HashSet;
 
-use futures::{
-    AsyncBufRead, AsyncBufReadExt, StreamExt, TryStreamExt,
-    stream::{self, BoxStream},
-};
+use futures::{AsyncBufRead, AsyncBufReadExt, Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use serde::{Deserialize, Serialize};
 
@@ -54,18 +51,17 @@ impl Table {
     pub async fn read_commit(&self, i: usize) -> anyhow::Result<Vec<Action>> {
         let path = Path::from("_delta_log");
         let path = path.join(format!("{:0>20}.json", i.to_string()));
-        let lines = self.read_commit_file(&path.to_string()).collect().await;
-        return Ok(lines);
+        let lines: Vec<Action> = self.read_commit_file(path).await?.collect().await;
+        Ok(lines)
     }
 
     pub async fn files(&self) -> anyhow::Result<Vec<String>> {
-        let files = self
-            .commit_list()
-            .flat_map(|file| {
-                return self.read_commit_file(&file.location.to_string());
-            })
-            .fold(HashSet::<String>::new(), async |mut files, a| {
-                match a {
+        let mut files = HashSet::<String>::new();
+        let mut commits = self.commit_list();
+        while let Some(commit) = commits.next().await {
+            let mut actions = Box::pin(self.read_commit_file(commit.location).await?);
+            while let Some(action) = actions.next().await {
+                match action {
                     Action::Add(add) => {
                         files.insert(add.path);
                     }
@@ -73,30 +69,23 @@ impl Table {
                         files.remove(&remove.path);
                     }
                     _ => {}
-                };
-                return files;
-            })
-            .await;
+                }
+            }
+        }
 
-        return Ok(files.into_iter().collect());
+        Ok(files.into_iter().collect())
     }
 
-    fn read_commit_file<'a>(&'a self, path: &str) -> BoxStream<'a, Action> {
-        let path = Path::from(path);
-        let s = stream::once(async move {
-            let r = self.store.get(&path).await.expect("result failed");
-            let reader = into_buf_reader(r);
-            let s = reader.lines().filter_map(async |s| {
-                let Ok(s) = s else { return None };
-                let Ok(action) = serde_json::from_str::<Action>(&s) else {
-                    return None;
-                };
-                return Some(action);
-            });
-            return s;
-        })
-        .flatten();
-        return Box::pin(s);
+    async fn read_commit_file(
+        &self,
+        path: Path,
+    ) -> anyhow::Result<impl Stream<Item = Action> + use<>> {
+        let r = self.store.get(&path).await?;
+        let s = into_buf_reader(r).lines().filter_map(async |s| {
+            let Ok(s) = s else { return None };
+            serde_json::from_str::<Action>(&s).ok()
+        });
+        Ok(s)
     }
 }
 
