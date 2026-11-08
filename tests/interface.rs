@@ -1,4 +1,4 @@
-use delta_force::Table;
+use delta_force::{Action, Protocol, Table};
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 
 /// Put an (empty) commit file in the log. Contents don't matter for
@@ -25,6 +25,37 @@ async fn version_is_the_latest_commit() {
     let table = Table::new(Box::new(storage));
 
     assert_eq!(table.version().await.unwrap(), Some(2));
+}
+
+#[tokio::test]
+async fn read_commit_parses_protocol_and_metadata() {
+    let storage = InMemory::new();
+    let commit = [
+        r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
+        r#"{"metaData":{"id":"table-id","format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":[],"configuration":{},"createdTime":1700000000000}}"#,
+    ]
+    .join("\n");
+    storage
+        .put(
+            &Path::from("_delta_log/00000000000000000000.json"),
+            commit.into(),
+        )
+        .await
+        .unwrap();
+
+    let table = Table::new(Box::new(storage));
+    let actions = table.read_commit(0).await.unwrap();
+
+    assert_eq!(actions.len(), 2);
+    assert!(matches!(
+        actions[0],
+        Action::Protocol(Protocol {
+            min_reader_version: 1,
+            min_writer_version: 2,
+            ..
+        })
+    ));
+    assert!(matches!(&actions[1], Action::Metadata(m) if m.id == "table-id"));
 }
 
 #[tokio::test]
