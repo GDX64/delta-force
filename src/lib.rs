@@ -17,6 +17,7 @@
 //! ```
 //!
 //! Parquet, Arrow and the storage layer stay internal.
+mod changes;
 mod delta;
 mod engine;
 mod error;
@@ -24,6 +25,7 @@ mod lake;
 mod row;
 mod sync_store;
 
+pub use changes::{ApplyMode, Change, Changes, ChangesConfig};
 pub use error::{Error, Result};
-pub use lake::{DataType, DeltaForce, Table, TableConfig};
+pub use lake::{APPLY_BATCH, Applied, DataType, DeltaForce, Table, TableConfig};
 pub use row::{FromValue, Row, Rows, Value};

@@ -10,10 +10,13 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema};
+use futures_util::StreamExt;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
+use crate::changes::apply_to_rows;
 use crate::delta::DeltaTable;
+use crate::Changes;
 use crate::engine::ObjectStoreEngine;
 use crate::{Error, Result, Row, Rows, Value};
 
@@ -201,6 +204,49 @@ impl Table {
         .await
     }
 
+    /// Read `changes` as a stream and apply them by key, committing every
+    /// [`APPLY_BATCH`] changes and once more at the end. Resolves when the
+    /// stream ends. On error, earlier batches stay committed.
+    pub async fn apply(&self, changes: Changes) -> Result<Applied> {
+        let key = changes.config().key_column()?.to_owned();
+        let mut stream = changes.into_stream();
+        let mut applied = Applied::default();
+        loop {
+            let mut batch = Vec::new();
+            while batch.len() < APPLY_BATCH {
+                match stream.next().await {
+                    Some(change) => batch.push(change?),
+                    None => break,
+                }
+            }
+            if batch.is_empty() {
+                return Ok(applied);
+            }
+            let (inner, key) = (self.inner.clone(), key.clone());
+            let count = batch.len();
+            blocking(move || {
+                let columns = table_columns(&inner.arrow_schema()?)?;
+                if !columns.iter().any(|c| c.name == key) {
+                    return Err(Error::ColumnNotFound(key));
+                }
+                inner.rewrite(|current| {
+                    let mut rows = Vec::new();
+                    for batch in &current {
+                        rows.extend(batch_rows(batch)?);
+                    }
+                    let rows = apply_to_rows(rows, &batch, &key)?;
+                    if rows.is_empty() {
+                        return Ok(None);
+                    }
+                    to_batch(&columns, &rows).map(Some)
+                })
+            })
+            .await?;
+            applied.changes += count;
+            applied.commits += 1;
+        }
+    }
+
     /// All rows at the latest version.
     pub async fn rows(&self) -> Result<Rows> {
         let inner = self.inner.clone();
@@ -213,6 +259,18 @@ impl Table {
         })
         .await
     }
+}
+
+/// How many changes [`Table::apply`] groups into one commit.
+pub const APPLY_BATCH: usize = 10_000;
+
+/// What [`Table::apply`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Applied {
+    /// Changes read from the stream.
+    pub changes: usize,
+    /// Commits made.
+    pub commits: usize,
 }
 
 /// The kernel is synchronous; run it off the async worker threads.

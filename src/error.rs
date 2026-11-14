@@ -20,6 +20,11 @@ pub enum Error {
     },
     /// `write` was called with no rows.
     NoRows,
+    InvalidConfig(String),
+    /// An insert used a key that already exists (or the table has duplicates).
+    DuplicateKey(String),
+    /// An update used a key that doesn't exist.
+    KeyNotFound(String),
     /// Storage or Delta protocol failure.
     Storage(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -37,6 +42,9 @@ impl fmt::Display for Error {
                 write!(f, "column {column:?}: expected {expected}, found {found}")
             }
             Error::NoRows => f.write_str("no rows to write"),
+            Error::InvalidConfig(m) => write!(f, "invalid config: {m}"),
+            Error::DuplicateKey(k) => write!(f, "duplicate key {k}"),
+            Error::KeyNotFound(k) => write!(f, "key {k} not found"),
             Error::Storage(e) => write!(f, "storage error: {e}"),
         }
     }

@@ -88,15 +88,50 @@ impl DeltaTable {
         committed_version(txn.commit(engine)?)
     }
 
+    /// Copy-on-write rewrite of the whole table in one commit: `f` gets the
+    /// current data and returns the replacement (`None` = table becomes empty).
+    /// Reads and removes from the same snapshot, so a concurrent writer makes
+    /// the commit conflict instead of losing data.
+    pub fn rewrite<E: From<anyhow::Error>>(
+        &self,
+        f: impl FnOnce(Vec<RecordBatch>) -> Result<Option<RecordBatch>, E>,
+    ) -> Result<u64, E> {
+        let engine = self.engine.as_ref();
+        let snapshot = self.snapshot().map_err(anyhow::Error::from)?;
+        let scan = snapshot
+            .clone()
+            .scan_builder()
+            .build()
+            .map_err(anyhow::Error::from)?;
+        let current = self.collect(&scan)?;
+        let new = f(current)?;
+
+        let commit = || -> anyhow::Result<u64> {
+            let mut txn = snapshot
+                .update_table(UpdateTableOperation::Merge, ENGINE_INFO, true)
+                .build(engine, Box::new(FileSystemCommitter::new()))?;
+            for metadata in scan.scan_metadata(engine)? {
+                txn.remove_files(metadata?.scan_files);
+            }
+            if let Some(batch) = new {
+                let context = txn.write_state()?.write_context_builder().build()?;
+                txn.add_files(engine.write_data_file(batch, &context)?);
+            }
+            committed_version(txn.commit(engine)?)
+        };
+        Ok(commit()?)
+    }
+
+    fn collect(&self, scan: &delta_kernel::scan::Scan) -> anyhow::Result<Vec<RecordBatch>> {
+        scan.execute(self.engine.clone())?
+            .map(|data| Ok(RecordBatch::from(ArrowEngineData::try_from_engine_data(data?)?)))
+            .collect()
+    }
+
     /// Read the whole table at its latest version.
     pub fn read(&self) -> anyhow::Result<Vec<RecordBatch>> {
         let scan = self.snapshot()?.scan_builder().build()?;
-        scan.execute(self.engine.clone())?
-            .map(|data| {
-                let data = ArrowEngineData::try_from_engine_data(data?)?;
-                Ok(RecordBatch::from(data))
-            })
-            .collect()
+        self.collect(&scan)
     }
 }
 

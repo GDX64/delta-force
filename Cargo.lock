@@ -652,6 +652,7 @@ dependencies = [
  "bytes",
  "delta_kernel",
  "delta_kernel_default_engine",
+ "futures-util",
  "object_store",
  "tempfile",
  "tokio",
