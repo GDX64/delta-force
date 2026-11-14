@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 fn new_table() -> (TempDir, Table) {
     let dir = TempDir::new().unwrap();
-    let table = Table::new(dir.path().join("table")).unwrap();
+    let table = Table::local(dir.path().join("table")).unwrap();
     (dir, table)
 }
 
@@ -81,12 +81,35 @@ fn read_returns_what_was_written() {
 fn reopening_the_table_sees_earlier_commits() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("table");
-    let table = Table::new(&path).unwrap();
+    let table = Table::local(&path).unwrap();
     table.create(&id_schema()).unwrap();
     table.write(ids(vec![7])).unwrap();
 
-    let reopened = Table::new(&path).unwrap();
+    let reopened = Table::local(&path).unwrap();
 
     assert_eq!(reopened.version().unwrap(), Some(1));
     assert_eq!(reopened.read().unwrap()[0].num_rows(), 1);
+}
+
+#[test]
+fn works_on_an_in_memory_store() {
+    let table = Table::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        url::Url::parse("memory:///").unwrap(),
+    );
+    assert_eq!(table.version().unwrap(), None);
+
+    table.create(&id_schema()).unwrap();
+    table.write(ids(vec![1, 2])).unwrap();
+
+    assert_eq!(table.version().unwrap(), Some(1));
+    assert_eq!(table.read().unwrap()[0].num_rows(), 2);
+}
+
+#[tokio::test]
+async fn can_be_used_from_inside_an_async_runtime() {
+    let (_dir, table) = new_table();
+    table.create(&id_schema()).unwrap();
+
+    assert_eq!(table.write(ids(vec![1])).unwrap(), 1);
 }

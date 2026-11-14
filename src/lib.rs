@@ -1,7 +1,7 @@
 //! A small Delta table built on top of [`delta_kernel`].
 //!
 //! The kernel owns the protocol logic (log replay, checkpoints, scans, commits);
-//! this crate supplies the [`LocalEngine`] it calls for I/O and exposes a tiny
+//! this crate supplies the [`ObjectStoreEngine`] it calls for I/O and exposes a tiny
 //! table API.
 use std::sync::Arc;
 
@@ -15,32 +15,47 @@ use delta_kernel::{
     schema::StructType,
     transaction::{CommitResult, UpdateTableOperation, create_table::create_table},
 };
+use object_store::{ObjectStore, local::LocalFileSystem};
 use url::Url;
 
 mod engine;
-pub use engine::LocalEngine;
+mod sync_store;
+pub use engine::ObjectStoreEngine;
 
 const ENGINE_INFO: &str = concat!("delta-force/", env!("CARGO_PKG_VERSION"));
 
 /// A Delta table: a directory of data files plus a `_delta_log/` of commits.
 ///
-/// All I/O goes through our own [`LocalEngine`] (local filesystem only).
+/// All I/O goes through our own [`ObjectStoreEngine`].
 pub struct Table {
-    engine: Arc<LocalEngine>,
+    engine: Arc<ObjectStoreEngine>,
     url: Url,
 }
 
 impl Table {
-    /// Open the table rooted at the local directory `path`; the directory is
-    /// created if missing. Nothing is read until you call a method.
-    pub fn new(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+    /// Bind a table to `store`. `root` is the table root as the kernel sees
+    /// it; its path is used as the object path inside the store (e.g.
+    /// `memory:///` for an in-memory store, `s3://bucket/path/to/table`).
+    /// Nothing is read until you call a method.
+    pub fn new(store: Arc<dyn ObjectStore>, mut root: Url) -> Self {
+        // The kernel treats the root as a directory.
+        if !root.path().ends_with('/') {
+            root.set_path(&format!("{}/", root.path()));
+        }
+        Self {
+            engine: Arc::new(ObjectStoreEngine::new(store)),
+            url: root,
+        }
+    }
+
+    /// Open a table in the local directory `path`, creating it if missing.
+    pub fn local(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         std::fs::create_dir_all(path.as_ref())?;
-        let url = Url::from_directory_path(std::fs::canonicalize(path)?)
+        // The store sees the whole filesystem; the table root is the
+        // directory's absolute `file://` URL (its path is the object path).
+        let root = Url::from_directory_path(std::path::absolute(path)?)
             .map_err(|()| anyhow::anyhow!("invalid table path"))?;
-        Ok(Self {
-            engine: Arc::new(LocalEngine::new()),
-            url,
-        })
+        Ok(Self::new(Arc::new(LocalFileSystem::new()), root))
     }
 
     fn snapshot(&self) -> delta_kernel::KernelResult<Arc<Snapshot>> {

@@ -652,7 +652,9 @@ dependencies = [
  "bytes",
  "delta_kernel",
  "delta_kernel_default_engine",
+ "object_store",
  "tempfile",
+ "tokio",
  "url",
  "uuid",
 ]

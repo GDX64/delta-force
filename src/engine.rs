@@ -1,17 +1,17 @@
-//! A tiny, synchronous, local-filesystem [`Engine`].
+//! A tiny, synchronous [`Engine`] on top of any [`ObjectStore`].
 //!
 //! The kernel decides *what* to read and write; the engine does the actual I/O
 //! and data processing through four handlers:
 //!
-//! * [`LocalStorage`]: list / read / put / head / delete files (here: `std::fs`)
-//! * [`LocalJson`]: read and write JSON commit files
-//! * [`LocalParquet`]: read and write Parquet data and checkpoint files
+//! * [`StoreStorage`]: list / read / put / head / delete files (via the store)
+//! * [`StoreJson`]: read and write JSON commit files
+//! * [`StoreParquet`]: read and write Parquet data and checkpoint files
 //! * the kernel's Arrow `EvaluationHandler`, reused as-is for expressions
 //!
-//! Only `file://` URLs are supported.
-use std::fs;
-use std::io::{BufReader, Cursor, ErrorKind, Write};
-use std::path::PathBuf;
+//! The kernel hands the engine absolute URLs; the URL's path is used as the
+//! object path inside the store. The kernel API is synchronous, so the store is
+//! wrapped in a [`SyncObjectStore`] that blocks on the async calls.
+use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -41,22 +41,27 @@ use delta_kernel::{
 use delta_kernel_default_engine::{
     build_add_file_metadata, parquet::DataFileMetadata, stats::collect_stats,
 };
+use object_store::path::Path;
+use object_store::ObjectStore;
 use url::Url;
 
-/// An [`Engine`] that reads and writes the local filesystem.
-pub struct LocalEngine {
-    storage: Arc<LocalStorage>,
-    json: Arc<LocalJson>,
-    parquet: Arc<LocalParquet>,
+use crate::sync_store::SyncObjectStore;
+
+/// An [`Engine`] that reads and writes through an [`ObjectStore`].
+pub struct ObjectStoreEngine {
+    storage: Arc<StoreStorage>,
+    json: Arc<StoreJson>,
+    parquet: Arc<StoreParquet>,
     evaluation: Arc<ArrowEvaluationHandler>,
 }
 
-impl LocalEngine {
-    pub fn new() -> Self {
+impl ObjectStoreEngine {
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        let io = SyncObjectStore::new(store);
         Self {
-            storage: Arc::new(LocalStorage),
-            json: Arc::new(LocalJson),
-            parquet: Arc::new(LocalParquet),
+            storage: Arc::new(StoreStorage { io: io.clone() }),
+            json: Arc::new(StoreJson { io: io.clone() }),
+            parquet: Arc::new(StoreParquet { io }),
             evaluation: Arc::new(ArrowEvaluationHandler {}),
         }
     }
@@ -103,13 +108,7 @@ impl LocalEngine {
     }
 }
 
-impl Default for LocalEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Engine for LocalEngine {
+impl Engine for ObjectStoreEngine {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.evaluation.clone()
     }
@@ -124,100 +123,93 @@ impl Engine for LocalEngine {
     }
 }
 
+// ---------------------------------------------- kernel <-> store adapters --
+
+/// The kernel names objects by absolute URL; the URL's path is the object path.
+fn object_path(url: &Url) -> KernelResult<Path> {
+    Path::from_url_path(url.path())
+        .map_err(|e| KernelError::generic(format!("bad object path in {url}: {e}")))
+}
+
+/// Map store errors onto the errors the kernel expects (it matches on
+/// `FileAlreadyExists` to detect a lost commit race).
+fn store_error(url: &Url, e: object_store::Error) -> KernelError {
+    match e {
+        object_store::Error::NotFound { .. } => KernelError::file_not_found(url),
+        object_store::Error::AlreadyExists { .. } => {
+            KernelError::FileAlreadyExists(url.to_string())
+        }
+        other => KernelError::generic(other.to_string()),
+    }
+}
+
+fn get(store: &SyncObjectStore, url: &Url) -> KernelResult<Bytes> {
+    store.get(&object_path(url)?).map_err(|e| store_error(url, e))
+}
+
+/// With `overwrite = false` this is the atomic "create if absent" that makes
+/// concurrent commits safe: only one writer can win a given version.
+fn put(store: &SyncObjectStore, url: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
+    store
+        .put(&object_path(url)?, data, overwrite)
+        .map_err(|e| store_error(url, e))
+}
+
+fn head(store: &SyncObjectStore, url: &Url) -> KernelResult<FileMeta> {
+    let meta = store.head(&object_path(url)?).map_err(|e| store_error(url, e))?;
+    Ok(FileMeta {
+        location: url.clone(),
+        last_modified: meta.last_modified.timestamp_millis(),
+        size: meta.size,
+    })
+}
+
 // ---------------------------------------------------------------- storage --
 
-pub struct LocalStorage;
-
-fn to_path(url: &Url) -> KernelResult<PathBuf> {
-    url.to_file_path()
-        .map_err(|()| KernelError::generic(format!("not a local file URL: {url}")))
+pub struct StoreStorage {
+    io: SyncObjectStore,
 }
 
-fn to_url(path: &std::path::Path) -> KernelResult<Url> {
-    Url::from_file_path(path)
-        .map_err(|()| KernelError::generic(format!("invalid path: {}", path.display())))
-}
-
-fn file_meta(url: Url, meta: &fs::Metadata) -> FileMeta {
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_millis() as i64);
-    FileMeta {
-        location: url,
-        last_modified: modified,
-        size: meta.len(),
-    }
-}
-
-fn read_file(url: &Url) -> KernelResult<Bytes> {
-    match fs::read(to_path(url)?) {
-        Ok(b) => Ok(b.into()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Err(KernelError::file_not_found(url)),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn put_file(url: &Url, data: &[u8], overwrite: bool) -> KernelResult<()> {
-    let path = to_path(url)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    // `create_new` fails if the file exists: this is the atomic "create if
-    // absent" that makes concurrent commits safe, since only one writer can
-    // win a given version. (A crash mid-write can leave a partial file; a
-    // production engine would write to a temp file and rename.)
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
-    let mut file = options.open(&path).map_err(|e| match e.kind() {
-        ErrorKind::AlreadyExists => KernelError::FileAlreadyExists(url.to_string()),
-        _ => e.into(),
-    })?;
-    file.write_all(data)?;
-    Ok(())
-}
-
-impl StorageHandler for LocalStorage {
+impl StorageHandler for StoreStorage {
     /// Files in the same directory as `path` whose name is `>=` its file name,
     /// in lexicographic order (a trailing `/` lists the whole directory).
     fn list_from(&self, path: &Url) -> KernelResult<KernelResultIteratorStatic<FileMeta>> {
-        let full = to_path(path)?;
-        let (dir, start) = if path.path().ends_with('/') {
+        let full = object_path(path)?;
+        let (dir, start): (Path, String) = if path.path().ends_with('/') {
             (full, String::new())
         } else {
-            let name = full
-                .file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().into());
-            (full.parent().map(PathBuf::from).unwrap_or_default(), name)
+            let start = full.filename().unwrap_or_default().to_string();
+            let parts: Vec<_> = full.parts().collect();
+            (parts[..parts.len().saturating_sub(1)].iter().cloned().collect(), start)
         };
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            // A table that doesn't exist yet simply has no files.
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Box::new(std::iter::empty())),
-            Err(e) => return Err(e.into()),
-        };
-        let mut files = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let meta = entry.metadata()?;
-            if meta.is_dir() || entry.file_name().to_string_lossy().as_ref() < start.as_str() {
-                continue;
-            }
-            files.push(file_meta(to_url(&entry.path())?, &meta));
-        }
+        // Non-recursive: only the files directly inside `dir`.
+        let listing = self
+            .io
+            .list_with_delimiter(&dir)
+            .map_err(|e| store_error(path, e))?;
+
+        let mut files: Vec<FileMeta> = listing
+            .objects
+            .into_iter()
+            .filter(|o| o.location.filename().is_some_and(|n| n >= start.as_str()))
+            .map(|o| {
+                let mut location = path.clone();
+                location.set_path(&format!("/{}", o.location.as_ref()));
+                FileMeta {
+                    location,
+                    last_modified: o.last_modified.timestamp_millis(),
+                    size: o.size,
+                }
+            })
+            .collect();
         files.sort_by(|a, b| a.location.cmp(&b.location));
         Ok(Box::new(files.into_iter().map(Ok)))
     }
 
     fn read_files(&self, files: Vec<FileSlice>) -> KernelResult<KernelResultIteratorStatic<Bytes>> {
-        Ok(Box::new(files.into_iter().map(|(url, range)| {
-            let bytes = read_file(&url)?;
+        let io = self.io.clone();
+        Ok(Box::new(files.into_iter().map(move |(url, range)| {
+            let bytes = get(&io, &url)?;
             Ok(match range {
                 Some(r) => bytes.slice(r.start as usize..(r.end as usize).min(bytes.len())),
                 None => bytes,
@@ -226,35 +218,36 @@ impl StorageHandler for LocalStorage {
     }
 
     fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> KernelResult<()> {
-        put_file(path, &data, overwrite)
+        put(&self.io, path, data, overwrite)
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> KernelResult<()> {
-        put_file(dest, &read_file(src)?, false)
+        let (from, to) = (object_path(src)?, object_path(dest)?);
+        self.io
+            .copy_if_not_exists(&from, &to)
+            .map_err(|e| store_error(dest, e))
     }
 
     fn head(&self, path: &Url) -> KernelResult<FileMeta> {
-        match fs::metadata(to_path(path)?) {
-            Ok(meta) => Ok(file_meta(path.clone(), &meta)),
-            Err(e) if e.kind() == ErrorKind::NotFound => Err(KernelError::file_not_found(path)),
-            Err(e) => Err(e.into()),
-        }
+        head(&self.io, path)
     }
 
     fn delete(&self, path: &Url) -> KernelResult<()> {
-        match fs::remove_file(to_path(path)?) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        let p = object_path(path)?;
+        match self.io.delete(&p) {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(store_error(path, e)),
         }
     }
 }
 
 // ------------------------------------------------------------------- json --
 
-pub struct LocalJson;
+pub struct StoreJson {
+    io: SyncObjectStore,
+}
 
-impl JsonHandler for LocalJson {
+impl JsonHandler for StoreJson {
     fn parse_json(
         &self,
         json_strings: Box<dyn EngineData>,
@@ -276,7 +269,7 @@ impl JsonHandler for LocalJson {
             let location = file.location.to_string();
             let reader = ReaderBuilder::new(arrow_schema.clone())
                 .with_coerce_primitive(true)
-                .build(BufReader::new(Cursor::new(read_file(&file.location)?)))?;
+                .build(BufReader::new(Cursor::new(get(&self.io, &file.location)?)))?;
             for batch in reader {
                 out.push(
                     fixup_json_read(batch?, &reorder, &location)
@@ -294,16 +287,19 @@ impl JsonHandler for LocalJson {
         overwrite: bool,
     ) -> KernelResult<FileSize> {
         let bytes = to_json_bytes(data)?;
-        put_file(path, &bytes, overwrite)?;
-        Ok(bytes.len() as FileSize)
+        let size = bytes.len() as FileSize;
+        put(&self.io, path, bytes.into(), overwrite)?;
+        Ok(size)
     }
 }
 
 // ---------------------------------------------------------------- parquet --
 
-pub struct LocalParquet;
+pub struct StoreParquet {
+    io: SyncObjectStore,
+}
 
-impl ParquetHandler for LocalParquet {
+impl ParquetHandler for StoreParquet {
     fn read_parquet_files(
         &self,
         files: &[FileMeta],
@@ -312,7 +308,7 @@ impl ParquetHandler for LocalParquet {
     ) -> KernelResult<FileDataReadResultIterator> {
         let mut out = Vec::new();
         for file in files {
-            let data = read_file(&file.location)?;
+            let data = get(&self.io, &file.location)?;
             let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
             // Which columns to read, and how to reorder / fill in the result.
             let (ordering, mask) = parquet_read_plan(&schema, &metadata)?;
@@ -365,12 +361,13 @@ impl ParquetHandler for LocalParquet {
             writer.write(batch)?;
         }
         writer.close()?; // writes the footer
-        put_file(&location, &buffer, true)?;
-        Ok(buffer.len() as FileSize)
+        let size = buffer.len() as FileSize;
+        put(&self.io, &location, buffer.into(), true)?;
+        Ok(size)
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
-        let data = read_file(&file.location)?;
+        let data = get(&self.io, &file.location)?;
         let metadata = ArrowReaderMetadata::load(&data, reader_options())?;
         let schema = Arc::new(StructType::try_from_arrow(metadata.schema().as_ref())?);
         Ok(ParquetFooter { schema })
