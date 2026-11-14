@@ -1,11 +1,10 @@
 #![feature(iterator_try_collect)]
-use std::collections::HashSet;
-
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use futures::{AsyncBufRead, AsyncBufReadExt, Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, path::Path};
 use parquet::arrow::ArrowWriter;
+use std::collections::HashSet;
 mod actions;
 pub use actions::{Action, Add, Metadata, Protocol, Remove};
 
@@ -54,6 +53,11 @@ impl Table {
     }
 
     pub async fn create(&self, schema: &Schema) -> anyhow::Result<u64> {
+        let current = self.version().await?;
+        if current.is_some() {
+            anyhow::bail!("Table already exists");
+        }
+
         let protocol = Protocol {
             min_reader_version: 1,
             min_writer_version: 2,
