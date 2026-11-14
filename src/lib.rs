@@ -1,7 +1,8 @@
 //! A small Delta table built on top of [`delta_kernel`].
 //!
 //! The kernel owns the protocol logic (log replay, checkpoints, scans, commits);
-//! this crate wires it to an [`ObjectStore`] and exposes a tiny table API.
+//! this crate supplies the [`LocalEngine`] it calls for I/O and exposes a tiny
+//! table API.
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -14,38 +15,32 @@ use delta_kernel::{
     schema::StructType,
     transaction::{CommitResult, UpdateTableOperation, create_table::create_table},
 };
-use delta_kernel_default_engine::{
-    DefaultEngine, executor::tokio::TokioBackgroundExecutor,
-};
-use object_store::ObjectStore;
 use url::Url;
+
+mod engine;
+pub use engine::LocalEngine;
 
 const ENGINE_INFO: &str = concat!("delta-force/", env!("CARGO_PKG_VERSION"));
 
-type Engine = DefaultEngine<TokioBackgroundExecutor>;
-
 /// A Delta table: a directory of data files plus a `_delta_log/` of commits.
 ///
-/// All I/O goes through an [`ObjectStore`], so the table works the same on
-/// local disk, S3, or in memory.
+/// All I/O goes through our own [`LocalEngine`] (local filesystem only).
 pub struct Table {
-    engine: Arc<Engine>,
+    engine: Arc<LocalEngine>,
     url: Url,
 }
 
 impl Table {
-    /// Bind a table to the given store. `url` is the table root as the kernel
-    /// sees it (e.g. `memory:///` for an [`InMemory`](object_store::memory::InMemory)
-    /// store). Nothing is read yet.
-    pub fn new(store: Arc<dyn ObjectStore>, mut url: Url) -> Self {
-        // The kernel treats the root as a directory.
-        if !url.path().ends_with('/') {
-            url.set_path(&format!("{}/", url.path()));
-        }
-        Self {
-            engine: Arc::new(DefaultEngine::builder(store).build()),
+    /// Open the table rooted at the local directory `path`; the directory is
+    /// created if missing. Nothing is read until you call a method.
+    pub fn new(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(path.as_ref())?;
+        let url = Url::from_directory_path(std::fs::canonicalize(path)?)
+            .map_err(|()| anyhow::anyhow!("invalid table path"))?;
+        Ok(Self {
+            engine: Arc::new(LocalEngine::new()),
             url,
-        }
+        })
     }
 
     fn snapshot(&self) -> delta_kernel::KernelResult<Arc<Snapshot>> {
@@ -72,7 +67,7 @@ impl Table {
     }
 
     /// Append a batch as a new Parquet file in one commit. Returns the version.
-    pub async fn write(&self, batch: RecordBatch) -> anyhow::Result<u64> {
+    pub fn write(&self, batch: RecordBatch) -> anyhow::Result<u64> {
         let engine = self.engine.as_ref();
         let mut txn = self
             .snapshot()?
@@ -80,10 +75,7 @@ impl Table {
             .build(engine, Box::new(FileSystemCommitter::new()))?;
 
         let context = txn.write_state()?.write_context_builder().build()?;
-        let file = engine
-            .write_parquet(&ArrowEngineData::new(batch), &context)
-            .await?;
-        txn.add_files(file);
+        txn.add_files(engine.write_data_file(batch, &context)?);
 
         committed_version(txn.commit(engine)?)
     }
