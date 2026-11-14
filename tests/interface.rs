@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use delta_force::{Action, Add, Protocol, Remove, Table};
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -184,6 +185,49 @@ async fn write_stores_a_parquet_file_and_commits_it() {
         .unwrap();
     assert_eq!(reader.next().unwrap().unwrap(), batch);
     assert!(reader.next().is_none());
+}
+
+fn id_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+}
+
+#[tokio::test]
+async fn create_writes_protocol_and_metadata_as_version_zero() {
+    let table = Table::new(Box::new(InMemory::new()));
+
+    let version = table.create(&id_schema()).await.unwrap();
+
+    assert_eq!(version, 0);
+    assert_eq!(table.version().await.unwrap(), Some(0));
+
+    let actions = table.read_commit(0).await.unwrap();
+    assert_eq!(actions.len(), 2);
+    assert!(matches!(
+        &actions[0],
+        Action::Protocol(Protocol {
+            min_reader_version: 1,
+            min_writer_version: 2,
+        })
+    ));
+
+    assert!(matches!(
+        &actions[1],
+        Action::Metadata(m)
+            if !m.id.is_empty()
+                && m.schema_string.contains(r#""name":"id""#)
+                && m.schema_string.contains(r#""type":"integer""#)
+                && m.schema_string.contains(r#""nullable":false"#)
+    ));
+}
+
+#[tokio::test]
+async fn create_fails_if_the_table_already_exists() {
+    let table = Table::new(Box::new(InMemory::new()));
+    table.create(&id_schema()).await.unwrap();
+
+    assert!(table.create(&id_schema()).await.is_err());
+    // The original commit is untouched.
+    assert_eq!(table.version().await.unwrap(), Some(0));
 }
 
 #[tokio::test]

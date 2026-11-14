@@ -2,10 +2,12 @@
 use std::collections::HashSet;
 
 use arrow_array::RecordBatch;
+use arrow_schema::Schema;
 use futures::{AsyncBufRead, AsyncBufReadExt, Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, path::Path};
 use parquet::arrow::ArrowWriter;
-use serde::{Deserialize, Serialize};
+mod actions;
+pub use actions::{Action, Add, Metadata, Protocol, Remove};
 
 /// A Delta table: a directory of data files plus a `_delta_log/` of JSON
 /// commits describing which files make up the table at each version.
@@ -49,6 +51,22 @@ impl Table {
             })
             .await
             .map_err(Into::into)
+    }
+
+    pub async fn create(&self, schema: &Schema) -> anyhow::Result<u64> {
+        let protocol = Protocol {
+            min_reader_version: 1,
+            min_writer_version: 2,
+        };
+
+        let protocol = Action::Protocol(protocol);
+        let meta_data = Metadata {
+            id: uuid::Uuid::new_v4().to_string(),
+            schema_string: Metadata::schema_string(schema),
+        };
+        let meta_data = Action::Metadata(meta_data);
+        let r = self.commit([protocol, meta_data]).await?;
+        return Ok(r);
     }
 
     fn file_name(version: u64) -> String {
@@ -135,45 +153,6 @@ impl Table {
         });
         Ok(s)
     }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum Action {
-    #[serde(rename = "protocol")]
-    Protocol(Protocol),
-    #[serde(rename = "metaData")]
-    Metadata(Metadata),
-    #[serde(rename = "add")]
-    Add(Add),
-    #[serde(rename = "remove")]
-    Remove(Remove),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct Protocol {
-    pub min_reader_version: u64,
-    pub min_writer_version: u64,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct Metadata {
-    pub id: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct Add {
-    pub path: String,
-    pub size: u64,
-    pub data_change: bool,
-}
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct Remove {
-    pub path: String,
-    pub data_change: bool,
 }
 
 /// Adapt an object-store download into an async, buffered reader.
