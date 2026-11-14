@@ -14,8 +14,8 @@ use futures_util::StreamExt;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
-use crate::changes::apply_to_rows;
-use crate::delta::DeltaTable;
+use crate::changes::plan;
+use crate::delta::{DeltaTable, MergePlan};
 use crate::Changes;
 use crate::engine::ObjectStoreEngine;
 use crate::{Error, Result, Row, Rows, Value};
@@ -207,6 +207,9 @@ impl Table {
     /// Read `changes` as a stream and apply them by key, committing every
     /// [`APPLY_BATCH`] changes and once more at the end. Resolves when the
     /// stream ends. On error, earlier batches stay committed.
+    ///
+    /// Merge-on-read: replaced and deleted rows are marked in deletion
+    /// vectors and new values are appended; existing files aren't rewritten.
     pub async fn apply(&self, changes: Changes) -> Result<Applied> {
         let key = changes.config().key_column()?.to_owned();
         let mut stream = changes.into_stream();
@@ -229,17 +232,28 @@ impl Table {
                 if !columns.iter().any(|c| c.name == key) {
                     return Err(Error::ColumnNotFound(key));
                 }
-                inner.rewrite(|current| {
-                    let mut rows = Vec::new();
-                    for batch in &current {
-                        rows.extend(batch_rows(batch)?);
+                inner.merge(|files| {
+                    let mut existing = Vec::new();
+                    for (index, file) in files.iter().enumerate() {
+                        let mut positions = file.positions.iter();
+                        for batch in &file.data {
+                            for row in batch_rows(batch)? {
+                                let position = *positions.next().expect("one position per row");
+                                existing.push(((index, position), row));
+                            }
+                        }
                     }
-                    let rows = apply_to_rows(rows, &batch, &key)?;
-                    if rows.is_empty() {
-                        return Ok(None);
+                    let plan = plan(existing, &batch, &key)?;
+                    let mut merge = MergePlan::default();
+                    for (index, position) in plan.delete {
+                        merge.deletes.entry(files[index].path.clone()).or_default().push(position);
                     }
-                    to_batch(&columns, &rows).map(Some)
-                })
+                    if !plan.append.is_empty() {
+                        merge.append = Some(to_batch(&columns, &plan.append)?);
+                    }
+                    Ok::<_, Error>(merge)
+                })?;
+                Ok(())
             })
             .await?;
             applied.changes += count;

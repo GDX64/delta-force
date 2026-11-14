@@ -125,12 +125,38 @@ fn key_text(row: &Row, column: &str) -> String {
     row.value(column).map_or_else(|| "null".into(), |v| format!("{v:?}"))
 }
 
-/// Apply `changes` to `rows` in order, by `key`. Returns the new rows.
-pub(crate) fn apply_to_rows(rows: Vec<Row>, changes: &[Change], key: &str) -> Result<Vec<Row>> {
-    let mut by_key: HashMap<Key, Row> = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let text = key_text(&row, key);
-        if by_key.insert(key_of(&row, key)?, row).is_some() {
+/// Where an existing row lives: data file index and row position in it.
+pub(crate) type Location = (usize, u64);
+
+/// The outcome of applying changes: existing rows to delete, new rows to add.
+#[derive(Debug, Default)]
+pub(crate) struct Plan {
+    pub delete: Vec<Location>,
+    pub append: Vec<Row>,
+}
+
+/// The state of one key while a batch is applied.
+struct Entry {
+    /// The row already in the table, if any.
+    origin: Option<Location>,
+    /// The key's current value (`None` = deleted).
+    row: Option<Row>,
+    /// Whether `row` differs from what is stored at `origin`.
+    changed: bool,
+}
+
+/// Apply `changes` in order, by `key`, to the table's live rows. Only the
+/// rows that change end up in the plan; everything else is untouched.
+pub(crate) fn plan(
+    existing: impl IntoIterator<Item = (Location, Row)>,
+    changes: &[Change],
+    key: &str,
+) -> Result<Plan> {
+    let mut entries: HashMap<Key, Entry> = HashMap::new();
+    for (location, row) in existing {
+        let (k, text) = (key_of(&row, key)?, key_text(&row, key));
+        let entry = Entry { origin: Some(location), row: Some(row), changed: false };
+        if entries.insert(k, entry).is_some() {
             return Err(Error::DuplicateKey(text));
         }
     }
@@ -139,23 +165,43 @@ pub(crate) fn apply_to_rows(rows: Vec<Row>, changes: &[Change], key: &str) -> Re
         let k = key_of(change.row(), key)?;
         match change {
             Change::Insert(row) => {
-                if by_key.contains_key(&k) {
+                let entry = entries
+                    .entry(k)
+                    .or_insert(Entry { origin: None, row: None, changed: false });
+                if entry.row.is_some() {
                     return Err(Error::DuplicateKey(key_text(row, key)));
                 }
-                by_key.insert(k, row.clone());
+                entry.row = Some(row.clone());
+                entry.changed = true;
             }
             Change::Update(row) => {
-                let existing = by_key
+                let current = entries
                     .get_mut(&k)
-                    .ok_or_else(|| Error::KeyNotFound(key_text(row, key)))?;
+                    .and_then(|e| e.row.as_mut().map(|r| (r, &mut e.changed)));
+                let (current, changed) =
+                    current.ok_or_else(|| Error::KeyNotFound(key_text(row, key)))?;
                 for (column, value) in row.columns() {
-                    existing.set(column, value.clone());
+                    current.set(column, value.clone());
                 }
+                *changed = true;
             }
             Change::Delete(_) => {
-                by_key.remove(&k);
+                if let Some(entry) = entries.get_mut(&k) {
+                    entry.row = None;
+                }
             }
         }
     }
-    Ok(by_key.into_values().collect())
+
+    let mut plan = Plan::default();
+    for entry in entries.into_values() {
+        let replaced = entry.row.is_none() || entry.changed;
+        if let (Some(location), true) = (entry.origin, replaced) {
+            plan.delete.push(location);
+        }
+        if let (Some(row), true) = (entry.row, entry.changed) {
+            plan.append.push(row);
+        }
+    }
+    Ok(plan)
 }
