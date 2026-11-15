@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use futures_util::stream::{self, BoxStream, StreamExt};
 
-use crate::{Error, Result, Row, Value};
+use crate::{ChangeBatch, Error, Result, Row, Value};
 
 /// One change to a row, identified by the key column in [`ChangesConfig`].
 #[derive(Debug, Clone, PartialEq)]
@@ -46,7 +46,7 @@ pub enum ApplyMode {
     Strict,
 }
 
-/// How to interpret a stream of [`Change`]s.
+/// How to interpret a stream of [`ChangeBatch`]es.
 #[derive(Debug, Clone, Default)]
 pub struct ChangesConfig {
     key: Option<String>,
@@ -76,19 +76,22 @@ impl ChangesConfig {
     }
 }
 
-/// A stream of changes plus the config that says how to apply them.
+/// A stream of change batches plus the config that says how to apply them.
 pub struct Changes {
     config: ChangesConfig,
-    stream: BoxStream<'static, Result<Change>>,
+    stream: BoxStream<'static, Result<ChangeBatch>>,
 }
 
 impl Changes {
-    /// Changes held in memory.
-    pub fn in_memory(config: ChangesConfig, changes: impl IntoIterator<Item = Change>) -> Self {
-        let changes: Vec<Change> = changes.into_iter().collect();
+    /// Change batches held in memory.
+    pub fn in_memory(
+        config: ChangesConfig,
+        batches: impl IntoIterator<Item = ChangeBatch>,
+    ) -> Self {
+        let batches: Vec<ChangeBatch> = batches.into_iter().collect();
         Self {
             config,
-            stream: stream::iter(changes.into_iter().map(Ok)).boxed(),
+            stream: stream::iter(batches.into_iter().map(Ok)).boxed(),
         }
     }
 
@@ -96,8 +99,8 @@ impl Changes {
         &self.config
     }
 
-    /// The changes as an async stream.
-    pub fn into_stream(self) -> BoxStream<'static, Result<Change>> {
+    /// The change batches as an async stream.
+    pub fn into_stream(self) -> BoxStream<'static, Result<ChangeBatch>> {
         self.stream
     }
 }

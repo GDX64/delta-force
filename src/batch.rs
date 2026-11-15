@@ -1,4 +1,4 @@
-//! [`RowBatch`]: rows to write, stored as columns.
+//! Columnar batches for writing: [`RowBatch`] and [`ChangeBatch`].
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -6,41 +6,139 @@ use arrow_array::builder::{
 };
 use arrow_array::{ArrayRef, RecordBatch};
 
-use crate::lake::{Column, DataType, arrow_schema};
-use crate::{Error, Result, Row, Value};
+use crate::lake::{Column, DataType, arrow_schema, value_at};
+use crate::{Change, Error, Result, Row, Value};
 
 /// Rows to write to a table, stored column by column as they are pushed.
 ///
 /// Get one from [`Table::batch`](crate::Table::batch), so it knows the
 /// table's columns and can check each row as it arrives.
 pub struct RowBatch {
-    columns: Arc<[Column]>,
-    builders: Vec<ColumnBuilder>,
-    len: usize,
-    /// Reused per push: the row's values, checked and in column order.
-    scratch: Vec<Value>,
+    builders: Builders,
 }
 
 impl RowBatch {
     pub(crate) fn new(columns: Arc<[Column]>) -> Self {
-        let builders = columns
-            .iter()
-            .map(|c| ColumnBuilder::new(c.data_type))
-            .collect();
-        Self {
-            columns,
-            builders,
-            len: 0,
-            scratch: Vec::new(),
-        }
+        Self { builders: Builders::new(columns) }
     }
 
     /// Add a row. Columns left out are null. On error the batch is unchanged.
-    pub fn push(&mut self, mut row: Row) -> Result<()> {
+    pub fn push(&mut self, row: Row) -> Result<()> {
+        self.builders.check(row, true)?;
+        self.builders.append_checked();
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.builders.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.builders.len == 0
+    }
+
+    pub(crate) fn finish(self) -> Result<RecordBatch> {
+        self.builders.finish()
+    }
+}
+
+/// Changes to apply to a table, stored column by column as they are pushed.
+///
+/// Get one from [`Table::change_batch`](crate::Table::change_batch). Each
+/// batch is applied in one commit.
+pub struct ChangeBatch {
+    builders: Builders,
+    kinds: Vec<Kind>,
+    /// Row-major: whether change `i` set column `c` (`i * columns + c`).
+    /// Updates and deletes only carry some columns.
+    present: Vec<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl ChangeBatch {
+    pub(crate) fn new(columns: Arc<[Column]>) -> Self {
+        Self { builders: Builders::new(columns), kinds: Vec::new(), present: Vec::new() }
+    }
+
+    /// Add a change. An insert needs every non-nullable column; an update or
+    /// delete only the columns it sets. On error the batch is unchanged.
+    pub fn push(&mut self, change: Change) -> Result<()> {
+        let (kind, row) = match change {
+            Change::Insert(row) => (Kind::Insert, row),
+            Change::Update(row) => (Kind::Update, row),
+            Change::Delete(row) => (Kind::Delete, row),
+        };
+        self.builders.check(row, kind == Kind::Insert)?;
+        self.present.extend_from_slice(&self.builders.present);
+        self.kinds.push(kind);
+        self.builders.append_checked();
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.kinds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
+    /// The changes in push order, for planning a merge.
+    pub(crate) fn into_changes(self) -> Result<Vec<Change>> {
+        let columns = self.builders.columns.clone();
+        let data = self.builders.finish()?;
+        let mut changes = Vec::with_capacity(self.kinds.len());
+        for (i, kind) in self.kinds.into_iter().enumerate() {
+            let mut row = Row::new();
+            for (c, column) in columns.iter().enumerate() {
+                if self.present[i * columns.len() + c] {
+                    row.set(column.name.clone(), value_at(data.column(c), i, &column.name)?);
+                }
+            }
+            changes.push(match kind {
+                Kind::Insert => Change::Insert(row),
+                Kind::Update => Change::Update(row),
+                Kind::Delete => Change::Delete(row),
+            });
+        }
+        Ok(changes)
+    }
+}
+
+/// One Arrow builder per column, with the per-row checks both batches share.
+struct Builders {
+    columns: Arc<[Column]>,
+    builders: Vec<ColumnBuilder>,
+    len: usize,
+    /// Set by [`Builders::check`]: the row's values, coerced, in column order.
+    scratch: Vec<Value>,
+    /// Set by [`Builders::check`]: which columns the row had.
+    present: Vec<bool>,
+}
+
+impl Builders {
+    fn new(columns: Arc<[Column]>) -> Self {
+        let builders = columns.iter().map(|c| ColumnBuilder::new(c.data_type)).collect();
+        Self { columns, builders, len: 0, scratch: Vec::new(), present: Vec::new() }
+    }
+
+    /// Check `row` against the columns without appending anything. With
+    /// `complete`, every non-nullable column must have a value; otherwise only
+    /// the columns the row sets are checked.
+    fn check(&mut self, mut row: Row, complete: bool) -> Result<()> {
         self.scratch.clear();
+        self.present.clear();
         for column in self.columns.iter() {
-            let value = row.take(&column.name).unwrap_or(Value::Null);
-            if value.is_null() && !column.nullable {
+            let value = row.take(&column.name);
+            let present = value.is_some();
+            let value = value.unwrap_or(Value::Null);
+            if value.is_null() && !column.nullable && (complete || present) {
                 return Err(Error::MissingValue(column.name.clone()));
             }
             let found = value.kind();
@@ -50,32 +148,24 @@ impl RowBatch {
                 found: found.to_owned(),
             })?;
             self.scratch.push(value);
+            self.present.push(present);
         }
         if let Some((name, _)) = row.columns().next() {
             return Err(Error::ColumnNotFound(name.to_owned()));
         }
-        // Everything is checked; append now so a failed push leaves no trace.
+        Ok(())
+    }
+
+    /// Append the row last [`check`](Builders::check)ed.
+    fn append_checked(&mut self) {
         for (builder, value) in self.builders.iter_mut().zip(self.scratch.drain(..)) {
             builder.append(value);
         }
         self.len += 1;
-        Ok(())
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub(crate) fn finish(self) -> Result<RecordBatch> {
-        let arrays: Vec<ArrayRef> = self
-            .builders
-            .into_iter()
-            .map(ColumnBuilder::finish)
-            .collect();
+    fn finish(self) -> Result<RecordBatch> {
+        let arrays: Vec<ArrayRef> = self.builders.into_iter().map(ColumnBuilder::finish).collect();
         RecordBatch::try_new(Arc::new(arrow_schema(&self.columns)), arrays)
             .map_err(|e| Error::Storage(e.into()))
     }

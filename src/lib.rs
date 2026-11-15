@@ -28,8 +28,8 @@ mod lake;
 mod row;
 mod sync_store;
 
-pub use batch::RowBatch;
+pub use batch::{ChangeBatch, RowBatch};
 pub use changes::{ApplyMode, Change, Changes, ChangesConfig};
 pub use error::{Error, Result};
-pub use lake::{APPLY_BATCH, Applied, DataType, DeltaForce, Table, TableConfig};
+pub use lake::{Applied, DataType, DeltaForce, Table, TableConfig};
 pub use row::{FromValue, Row, Rows, Value};

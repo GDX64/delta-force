@@ -15,15 +15,13 @@ async fn apply_a_stream_of_inserts_updates_and_deletes() -> anyhow::Result<()> {
     batch.push(row! { "id" => 2, "score" => 0.5 })?;
     events.write(batch).await?;
 
-    let changes = Changes::in_memory(
-        ChangesConfig::new().key("id"),
-        [
-            Change::insert(row! { "id" => 3, "score" => 0.1 }),
-            Change::update(row! { "id" => 1, "score" => 0.7 }),
-            Change::delete(row! { "id" => 2 }),
-        ],
-    );
-    events.apply(changes).await?;
+    let mut changes = events.change_batch();
+    changes.push(Change::insert(row! { "id" => 3, "score" => 0.1 }))?;
+    changes.push(Change::update(row! { "id" => 1, "score" => 0.7 }))?;
+    changes.push(Change::delete(row! { "id" => 2 }))?;
+
+    let stream = Changes::in_memory(ChangesConfig::new().key("id"), [changes]);
+    events.apply(stream).await?;
 
     assert_eq!(
         events.rows().await?.sorted_by("id"),

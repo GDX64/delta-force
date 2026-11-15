@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
-use crate::batch::RowBatch;
+use crate::batch::{ChangeBatch, RowBatch};
 use crate::changes::plan;
 use crate::delta::{DeltaTable, MergePlan};
 use crate::Changes;
@@ -206,9 +206,15 @@ impl Table {
         blocking(move || Ok(inner.write(batch)?)).await
     }
 
-    /// Read `changes` as a stream and apply them by key, committing every
-    /// [`APPLY_BATCH`] changes and once more at the end. Resolves when the
-    /// stream ends. On error, earlier batches stay committed.
+    /// An empty change batch for this table's columns. Fill it with
+    /// [`ChangeBatch::push`], then send it through [`Changes`].
+    pub fn change_batch(&self) -> ChangeBatch {
+        ChangeBatch::new(self.columns.clone())
+    }
+
+    /// Read `changes` as a stream and apply them by key, one commit per
+    /// batch. Resolves when the stream ends. On error, earlier batches stay
+    /// committed.
     ///
     /// Merge-on-read: replaced and deleted rows are marked in deletion
     /// vectors and new values are appended; existing files aren't rewritten.
@@ -216,20 +222,15 @@ impl Table {
         let key = changes.config().key_column()?.to_owned();
         let mut stream = changes.into_stream();
         let mut applied = Applied::default();
-        loop {
-            let mut batch = Vec::new();
-            while batch.len() < APPLY_BATCH {
-                match stream.next().await {
-                    Some(change) => batch.push(change?),
-                    None => break,
-                }
-            }
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
             if batch.is_empty() {
-                return Ok(applied);
+                continue;
             }
             let (inner, key) = (self.inner.clone(), key.clone());
             let count = batch.len();
             blocking(move || {
+                let batch = batch.into_changes()?;
                 let columns = table_columns(&inner.arrow_schema()?)?;
                 if !columns.iter().any(|c| c.name == key) {
                     return Err(Error::ColumnNotFound(key));
@@ -265,6 +266,7 @@ impl Table {
             applied.changes += count;
             applied.commits += 1;
         }
+        Ok(applied)
     }
 
     /// All rows at the latest version.
@@ -281,15 +283,12 @@ impl Table {
     }
 }
 
-/// How many changes [`Table::apply`] groups into one commit.
-pub const APPLY_BATCH: usize = 10_000;
-
 /// What [`Table::apply`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// Changes read from the stream.
+    /// Changes applied.
     pub changes: usize,
-    /// Commits made.
+    /// Commits made (one per non-empty batch).
     pub commits: usize,
 }
 
@@ -350,7 +349,7 @@ fn batch_rows(batch: &RecordBatch) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-fn value_at(array: &dyn Array, i: usize, column: &str) -> Result<Value> {
+pub(crate) fn value_at(array: &dyn Array, i: usize, column: &str) -> Result<Value> {
     if array.is_null(i) {
         return Ok(Value::Null);
     }
