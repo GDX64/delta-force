@@ -1,17 +1,19 @@
 //! Test helpers, behind the `test-util` feature: a [`TestStore`] that can
-//! serve virtual files, generated on the fly, for benchmarks.
-use std::collections::HashMap;
+//! serve virtual files, generated on the fly, and counts what is read, for
+//! benchmarks.
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::Range;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::FutureExt;
 use futures_util::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart,
 };
 
 /// Virtual files are generated at most this many bytes at a time.
@@ -27,16 +29,96 @@ struct VirtualFile {
 
 /// An object store that serves virtual files, whose bytes are generated on
 /// read, and sends every other path to an inner store. Virtual files are
-/// read-only and don't show up in listings. Clones share the same files.
+/// read-only and don't show up in listings. Reads and writes are counted,
+/// see [`TestStore::stats`]. Clones share the same files and counts.
 #[derive(Clone)]
 pub struct TestStore {
     inner: Arc<dyn ObjectStore>,
     files: Arc<RwLock<HashMap<Path, VirtualFile>>>,
+    counts: Arc<Mutex<BTreeMap<String, FileStats>>>,
+}
+
+/// What went through a [`TestStore`] so far, from [`TestStore::stats`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Reads of every file together.
+    pub reads: Reads,
+    /// Writes of every file together.
+    pub writes: Writes,
+    /// Each file read or written, by path.
+    pub files: BTreeMap<String, FileStats>,
+}
+
+/// Reads and writes of one file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileStats {
+    pub reads: Reads,
+    pub writes: Writes,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reads {
+    /// Gets of the file's data, whole or a range; `head` isn't counted.
+    pub gets: u64,
+    /// Bytes the readers pulled, which can be fewer than they asked for.
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Writes {
+    /// Puts; a multipart upload is one put, whatever its number of parts.
+    pub puts: u64,
+    /// Bytes sent.
+    pub bytes: u64,
 }
 
 impl TestStore {
     pub fn new(inner: impl ObjectStore) -> Self {
-        Self { inner: Arc::new(inner), files: Default::default() }
+        Self {
+            inner: Arc::new(inner),
+            files: Default::default(),
+            counts: Default::default(),
+        }
+    }
+
+    /// Everything read and written through this store so far.
+    pub fn stats(&self) -> Stats {
+        let files = self.counts.lock().unwrap().clone();
+        let mut stats = Stats::default();
+        for file in files.values() {
+            stats.reads.gets += file.reads.gets;
+            stats.reads.bytes += file.reads.bytes;
+            stats.writes.puts += file.writes.puts;
+            stats.writes.bytes += file.writes.bytes;
+        }
+        Stats { files, ..stats }
+    }
+
+    fn count(&self, location: &Path, update: impl FnOnce(&mut FileStats)) {
+        let mut files = self.counts.lock().unwrap();
+        update(files.entry(location.to_string()).or_default());
+    }
+
+    /// Count the get, and the bytes of `result` as they are pulled.
+    fn counted(&self, location: &Path, mut result: GetResult) -> GetResult {
+        self.count(location, |f| f.reads.gets += 1);
+        let (store, location) = (self.clone(), location.clone());
+        let (meta, range) = (result.meta.clone(), result.range.clone());
+        let attributes = std::mem::take(&mut result.attributes);
+        let extensions = std::mem::take(&mut result.extensions);
+        let payload = result.into_stream().map(move |chunk| {
+            if let Ok(bytes) = &chunk {
+                store.count(&location, |f| f.reads.bytes += bytes.len() as u64);
+            }
+            chunk
+        });
+        GetResult {
+            payload: GetResultPayload::Stream(payload.boxed()),
+            meta,
+            range,
+            attributes,
+            extensions,
+        }
     }
 
     /// A store whose real files live under the local directory `dir`,
@@ -57,8 +139,14 @@ impl TestStore {
         size: u64,
         generate: impl Fn(Range<u64>) -> Bytes + Send + Sync + 'static,
     ) {
-        let file = VirtualFile { size, generate: Arc::new(generate) };
-        self.files.write().unwrap().insert(Path::from(path.into()), file);
+        let file = VirtualFile {
+            size,
+            generate: Arc::new(generate),
+        };
+        self.files
+            .write()
+            .unwrap()
+            .insert(Path::from(path.into()), file);
     }
 
     fn virtual_file(&self, path: &Path) -> Option<VirtualFile> {
@@ -85,16 +173,21 @@ fn serve(location: &Path, file: VirtualFile, options: GetOptions) -> Result<GetR
     };
     options.check_preconditions(&meta)?;
     let range = match &options.range {
-        Some(range) => range.as_range(file.size).map_err(|e| object_store::Error::Generic {
-            store: "TestStore",
-            source: Box::new(e),
-        })?,
+        Some(range) => range
+            .as_range(file.size)
+            .map_err(|e| object_store::Error::Generic {
+                store: "TestStore",
+                source: Box::new(e),
+            })?,
         None => 0..file.size,
     };
-    let chunks = if options.head { range.end..range.end } else { range.clone() };
-    let payload = stream::iter(chunks.step_by(CHUNK as usize)).map(move |start| {
-        Ok((file.generate)(start..(start + CHUNK).min(range.end)))
-    });
+    let chunks = if options.head {
+        range.end..range.end
+    } else {
+        range.clone()
+    };
+    let payload = stream::iter(chunks.step_by(CHUNK as usize))
+        .map(move |start| Ok((file.generate)(start..(start + CHUNK).min(range.end))));
     Ok(GetResult {
         payload: GetResultPayload::Stream(payload.boxed()),
         meta,
@@ -113,7 +206,13 @@ impl ObjectStore for TestStore {
         opts: PutOptions,
     ) -> Result<PutResult> {
         self.read_only(location)?;
-        self.inner.put_opts(location, payload, opts).await
+        let bytes = payload.content_length() as u64;
+        let result = self.inner.put_opts(location, payload, opts).await?;
+        self.count(location, |f| {
+            f.writes.puts += 1;
+            f.writes.bytes += bytes;
+        });
+        Ok(result)
     }
 
     async fn put_multipart_opts(
@@ -122,14 +221,22 @@ impl ObjectStore for TestStore {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         self.read_only(location)?;
-        self.inner.put_multipart_opts(location, opts).await
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        self.count(location, |f| f.writes.puts += 1);
+        Ok(Box::new(CountedUpload { inner, store: self.clone(), location: location.clone() }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        match self.virtual_file(location) {
-            Some(file) => serve(location, file, options),
-            None => self.inner.get_opts(location, options).await,
-        }
+        let head = options.head;
+        let result = match self.virtual_file(location) {
+            Some(file) => serve(location, file, options)?,
+            None => self.inner.get_opts(location, options).await?,
+        };
+        Ok(if head {
+            result
+        } else {
+            self.counted(location, result)
+        })
     }
 
     fn delete_stream(
@@ -151,6 +258,37 @@ impl ObjectStore for TestStore {
         self.read_only(from)?;
         self.read_only(to)?;
         self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A multipart upload whose parts are counted as writes of `location`.
+#[derive(Debug)]
+struct CountedUpload {
+    inner: Box<dyn MultipartUpload>,
+    store: TestStore,
+    location: Path,
+}
+
+#[async_trait]
+impl MultipartUpload for CountedUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let bytes = data.content_length() as u64;
+        let part = self.inner.put_part(data);
+        let (store, location) = (self.store.clone(), self.location.clone());
+        async move {
+            part.await?;
+            store.count(&location, |f| f.writes.bytes += bytes);
+            Ok(())
+        }
+        .boxed()
+    }
+
+    async fn complete(&mut self) -> Result<PutResult> {
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.inner.abort().await
     }
 }
 
@@ -232,6 +370,79 @@ mod tests {
             store.get(&path).await.unwrap().bytes().await.unwrap(),
             "data"
         );
+    }
+
+    #[tokio::test]
+    async fn reads_count_gets_and_the_bytes_streamed() {
+        let store = TestStore::new(InMemory::new());
+        store.create_virtual_file("letters.txt", 30, alphabet);
+        let letters = Path::from("letters.txt");
+        let other = Path::from("other.txt");
+        store.put(&other, PutPayload::from("data")).await.unwrap();
+
+        store.get(&letters).await.unwrap().bytes().await.unwrap();
+        store.get_range(&letters, 24..28).await.unwrap();
+        store.head(&letters).await.unwrap(); // metadata only: not a get
+        store.get(&other).await.unwrap().bytes().await.unwrap();
+
+        let stats = store.stats();
+        assert_eq!(stats.reads, Reads { gets: 3, bytes: 38 });
+        assert_eq!(
+            stats.files["letters.txt"].reads,
+            Reads { gets: 2, bytes: 34 }
+        );
+        assert_eq!(stats.files["other.txt"].reads, Reads { gets: 1, bytes: 4 });
+        assert_eq!(stats.files.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn only_bytes_actually_pulled_are_counted() {
+        let store = TestStore::new(InMemory::new());
+        store.create_virtual_file("big.txt", 10 * 1024 * 1024, alphabet);
+        let path = Path::from("big.txt");
+
+        let mut chunks = store.get(&path).await.unwrap().into_stream();
+        let first = chunks.next().await.unwrap().unwrap();
+        drop(chunks);
+
+        assert_eq!(
+            store.stats().reads,
+            Reads {
+                gets: 1,
+                bytes: first.len() as u64
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_count_puts_and_their_bytes() {
+        let store = TestStore::new(InMemory::new());
+        let small = Path::from("small.txt");
+        let large = Path::from("large.txt");
+
+        store.put(&small, PutPayload::from("data")).await.unwrap();
+        store
+            .put(&small, PutPayload::from("more data"))
+            .await
+            .unwrap();
+        // A multipart upload is one put, whatever the number of parts.
+        let mut upload = store.put_multipart(&large).await.unwrap();
+        upload.put_part(PutPayload::from("abc")).await.unwrap();
+        upload.put_part(PutPayload::from("defg")).await.unwrap();
+        upload.complete().await.unwrap();
+
+        let stats = store.stats();
+        assert_eq!(stats.writes, Writes { puts: 3, bytes: 20 });
+        assert_eq!(
+            stats.files["small.txt"].writes,
+            Writes { puts: 2, bytes: 13 }
+        );
+        assert_eq!(
+            stats.files["large.txt"].writes,
+            Writes { puts: 1, bytes: 7 }
+        );
+        assert_eq!(stats.files["small.txt"].reads, Reads::default());
+        assert_eq!(stats.reads, Reads::default());
     }
 
     #[tokio::test]

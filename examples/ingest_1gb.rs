@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(OUT);
     let store = TestStore::on_disk(OUT)?;
     store.create_virtual_file("landing/events.csv", size, generate);
-    let lake = DeltaForce::with_test_store(store);
+    let lake = DeltaForce::with_test_store(store.clone());
     let events = lake
         .create(
             TableConfig::new("events")
@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
+    let io_before = store.stats();
     let before = process::stats();
     let start = Instant::now();
     let mut batch = events.batch();
@@ -68,6 +69,29 @@ async fn main() -> anyhow::Result<()> {
         human(before.peak_memory)
     );
     println!("output       {} in {files} file(s)", human(bytes));
+    let io = store.stats();
+    println!(
+        "reads        {} in {} get(s)",
+        human(io.reads.bytes - io_before.reads.bytes),
+        io.reads.gets - io_before.reads.gets
+    );
+    println!(
+        "writes       {} in {} put(s)",
+        human(io.writes.bytes - io_before.writes.bytes),
+        io.writes.puts - io_before.writes.puts
+    );
+    for (path, file) in &io.files {
+        let old = io_before.files.get(path).copied().unwrap_or_default();
+        let (gets, puts) = (file.reads.gets - old.reads.gets, file.writes.puts - old.writes.puts);
+        let read = human(file.reads.bytes - old.reads.bytes);
+        let written = human(file.writes.bytes - old.writes.bytes);
+        if gets > 0 {
+            println!("  read   {read:>10} in {gets:>2} get(s)  {path}");
+        }
+        if puts > 0 {
+            println!("  wrote  {written:>10} in {puts:>2} put(s)  {path}");
+        }
+    }
     Ok(())
 }
 
