@@ -53,3 +53,13 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
   documentation (register it in `tests/api/main.rs`). Edge cases belong in
   unit tests next to the code.
 - Run `cargo test` and `cargo clippy --all-targets` (no warnings) before committing.
+
+## Dev commands
+
+`./dev <command>` (works in bash and PowerShell; `./dev --help` lists them):
+
+| Command | What it does |
+|---|---|
+| `./dev benchmark [size]` | Ingests a generated CSV (default `1GB`, e.g. `100MB`) and reports wall time, CPU and peak memory. Source: `examples/ingest_1gb.rs`, which uses `TestStore` virtual files (`test-util` feature). |
+
+Add new commands to `dev.py`.

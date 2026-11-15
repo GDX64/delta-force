@@ -654,11 +654,13 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "futures-util",
+ "libc",
  "object_store",
  "tempfile",
  "tokio",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -131,6 +131,13 @@ impl DeltaForce {
         Self::with_store(Arc::new(InMemory::new()), root)
     }
 
+    /// A lake whose root is `store`, so it can read virtual files.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_test_store(store: crate::test_util::TestStore) -> Self {
+        let root = Url::parse("test:///").expect("valid url");
+        Self::with_store(Arc::new(store), root)
+    }
+
     fn with_store(store: Arc<dyn ObjectStore>, root: Url) -> Self {
         Self { engine: Arc::new(ObjectStoreEngine::new(store.clone())), store, root }
     }

@@ -39,6 +39,15 @@ impl TestStore {
         Self { inner: Arc::new(inner), files: Default::default() }
     }
 
+    /// A store whose real files live under the local directory `dir`,
+    /// created if missing.
+    pub fn on_disk(dir: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&dir)?;
+        let local = object_store::local::LocalFileSystem::new_with_prefix(dir)
+            .map_err(std::io::Error::other)?;
+        Ok(Self::new(local))
+    }
+
     /// Serve `size` bytes at `path`. `generate` returns the bytes of any
     /// range of the file, at most 64 KB at a time, and must always return
     /// the same bytes for the same range.
