@@ -14,12 +14,10 @@ async fn create_a_table_write_rows_and_read_them_back() -> anyhow::Result<()> {
         )
         .await?;
 
-    events
-        .write([
-            row! { "id" => 1, "score" => 0.9 },
-            row! { "id" => 2 }, // a nullable column can be left out
-        ])
-        .await?;
+    let mut batch = events.batch();
+    batch.push(row! { "id" => 1, "score" => 0.9 })?;
+    batch.push(row! { "id" => 2 })?; // a nullable column can be left out
+    events.write(batch).await?;
 
     let events = lake.table("events").await?;
     assert_eq!(

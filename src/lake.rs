@@ -3,17 +3,15 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::builder::{
-    ArrayBuilder, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema};
 use futures_util::StreamExt;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
+use crate::batch::RowBatch;
 use crate::changes::plan;
 use crate::delta::{DeltaTable, MergePlan};
 use crate::Changes;
@@ -67,10 +65,10 @@ impl fmt::Display for DataType {
 }
 
 #[derive(Debug, Clone)]
-struct Column {
-    name: String,
-    data_type: DataType,
-    nullable: bool,
+pub(crate) struct Column {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
 }
 
 /// The definition of a new table: its name and columns.
@@ -133,6 +131,7 @@ impl DeltaForce {
         validate_columns(&config.columns)?;
         let table = self.delta_table(&config.name)?;
         let schema = arrow_schema(&config.columns);
+        let columns: Arc<[Column]> = config.columns.into();
         let name = config.name.clone();
         let inner = blocking(move || {
             if table.version()?.is_some() {
@@ -142,19 +141,19 @@ impl DeltaForce {
             Ok(table)
         })
         .await?;
-        Ok(Table { name: config.name, inner })
+        Ok(Table { name: config.name, inner, columns })
     }
 
     /// Open an existing table. Fails with [`Error::TableNotFound`] if missing.
     pub async fn table(&self, name: &str) -> Result<Table> {
         let inner = self.delta_table(name)?;
         let (probe, owned) = (inner.clone(), name.to_owned());
-        blocking(move || match probe.version()? {
-            Some(_) => Ok(()),
+        let columns = blocking(move || match probe.version()? {
+            Some(_) => table_columns(&probe.arrow_schema()?),
             None => Err(Error::TableNotFound(owned)),
         })
         .await?;
-        Ok(Table { name: name.to_owned(), inner })
+        Ok(Table { name: name.to_owned(), inner, columns: columns.into() })
     }
 
     fn delta_table(&self, name: &str) -> Result<DeltaTable> {
@@ -176,6 +175,8 @@ impl DeltaForce {
 pub struct Table {
     name: String,
     inner: DeltaTable,
+    /// The schema as of when the table was opened or created.
+    columns: Arc<[Column]>,
 }
 
 impl Table {
@@ -189,19 +190,20 @@ impl Table {
         blocking(move || inner.version()?.ok_or(Error::TableNotFound(name))).await
     }
 
-    /// Append rows in one commit. Returns the new version.
-    pub async fn write(&self, rows: impl IntoIterator<Item = Row>) -> Result<u64> {
-        let rows: Vec<Row> = rows.into_iter().collect();
-        if rows.is_empty() {
+    /// An empty batch for this table's columns. Fill it with
+    /// [`RowBatch::push`], then hand it to [`Table::write`].
+    pub fn batch(&self) -> RowBatch {
+        RowBatch::new(self.columns.clone())
+    }
+
+    /// Append a batch in one commit. Returns the new version.
+    pub async fn write(&self, batch: RowBatch) -> Result<u64> {
+        if batch.is_empty() {
             return Err(Error::NoRows);
         }
+        let batch = batch.finish()?;
         let inner = self.inner.clone();
-        blocking(move || {
-            let columns = table_columns(&inner.arrow_schema()?)?;
-            let batch = to_batch(&columns, &rows)?;
-            Ok(inner.write(batch)?)
-        })
-        .await
+        blocking(move || Ok(inner.write(batch)?)).await
     }
 
     /// Read `changes` as a stream and apply them by key, committing every
@@ -249,7 +251,11 @@ impl Table {
                         merge.deletes.entry(files[index].path.clone()).or_default().push(position);
                     }
                     if !plan.append.is_empty() {
-                        merge.append = Some(to_batch(&columns, &plan.append)?);
+                        let mut rows = RowBatch::new(columns.into());
+                        for row in plan.append {
+                            rows.push(row)?;
+                        }
+                        merge.append = Some(rows.finish()?);
                     }
                     Ok::<_, Error>(merge)
                 })?;
@@ -309,7 +315,7 @@ fn validate_columns(columns: &[Column]) -> Result<()> {
     Ok(())
 }
 
-fn arrow_schema(columns: &[Column]) -> Schema {
+pub(crate) fn arrow_schema(columns: &[Column]) -> Schema {
     Schema::new(
         columns
             .iter()
@@ -329,95 +335,6 @@ fn table_columns(schema: &Schema) -> Result<Vec<Column>> {
             Ok(Column { name: f.name().clone(), data_type, nullable: f.is_nullable() })
         })
         .collect()
-}
-
-// ------------------------------------------------------------ rows -> arrow --
-
-fn to_batch(columns: &[Column], rows: &[Row]) -> Result<RecordBatch> {
-    for row in rows {
-        if let Some((name, _)) = row.columns().find(|(n, _)| !columns.iter().any(|c| c.name == *n)) {
-            return Err(Error::ColumnNotFound(name.to_owned()));
-        }
-    }
-    let null = Value::Null;
-    let arrays = columns
-        .iter()
-        .map(|column| {
-            let mut builder = ColumnBuilder::new(column.data_type, rows.len());
-            for row in rows {
-                let value = row.value(&column.name).unwrap_or(&null);
-                if value.is_null() && !column.nullable {
-                    return Err(Error::MissingValue(column.name.clone()));
-                }
-                if !builder.append(value) {
-                    return Err(Error::TypeMismatch {
-                        column: column.name.clone(),
-                        expected: column.data_type.to_string(),
-                        found: value.kind().to_owned(),
-                    });
-                }
-            }
-            Ok(builder.finish())
-        })
-        .collect::<Result<Vec<ArrayRef>>>()?;
-    RecordBatch::try_new(Arc::new(arrow_schema(columns)), arrays)
-        .map_err(|e| Error::Storage(e.into()))
-}
-
-enum ColumnBuilder {
-    Boolean(BooleanBuilder),
-    Integer(Int32Builder),
-    Long(Int64Builder),
-    Double(Float64Builder),
-    String(StringBuilder),
-}
-
-impl ColumnBuilder {
-    fn new(data_type: DataType, capacity: usize) -> Self {
-        match data_type {
-            DataType::Boolean => Self::Boolean(BooleanBuilder::with_capacity(capacity)),
-            DataType::Integer => Self::Integer(Int32Builder::with_capacity(capacity)),
-            DataType::Long => Self::Long(Int64Builder::with_capacity(capacity)),
-            DataType::Double => Self::Double(Float64Builder::with_capacity(capacity)),
-            DataType::String => Self::String(StringBuilder::with_capacity(capacity, capacity * 8)),
-        }
-    }
-
-    /// Append `value`, converting where lossless. `false` if it doesn't fit.
-    fn append(&mut self, value: &Value) -> bool {
-        /// Largest integer a double holds exactly.
-        const MAX_EXACT: i64 = 1 << 53;
-        match (self, value) {
-            (Self::Boolean(b), Value::Null) => b.append_null(),
-            (Self::Integer(b), Value::Null) => b.append_null(),
-            (Self::Long(b), Value::Null) => b.append_null(),
-            (Self::Double(b), Value::Null) => b.append_null(),
-            (Self::String(b), Value::Null) => b.append_null(),
-            (Self::Boolean(b), Value::Boolean(v)) => b.append_value(*v),
-            (Self::Integer(b), v) if v.as_i64().is_some() => match i32::try_from(v.as_i64().unwrap()) {
-                Ok(v) => b.append_value(v),
-                Err(_) => return false,
-            },
-            (Self::Long(b), v) if v.as_i64().is_some() => b.append_value(v.as_i64().unwrap()),
-            (Self::Double(b), Value::Double(v)) => b.append_value(*v),
-            (Self::Double(b), v) if v.as_i64().is_some_and(|i| i.abs() <= MAX_EXACT) => {
-                b.append_value(v.as_i64().unwrap() as f64)
-            }
-            (Self::String(b), Value::String(v)) => b.append_value(v),
-            _ => return false,
-        }
-        true
-    }
-
-    fn finish(self) -> ArrayRef {
-        match self {
-            Self::Boolean(mut b) => Arc::new(b.finish()),
-            Self::Integer(mut b) => Arc::new(b.finish()),
-            Self::Long(mut b) => Arc::new(b.finish()),
-            Self::Double(mut b) => Arc::new(b.finish()),
-            Self::String(mut b) => ArrayBuilder::finish(&mut b),
-        }
-    }
 }
 
 // ------------------------------------------------------------ arrow -> rows --

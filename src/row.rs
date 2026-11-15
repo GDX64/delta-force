@@ -182,6 +182,12 @@ impl Row {
         }
     }
 
+    /// Remove `column` from the row and return its value.
+    pub(crate) fn take(&mut self, column: &str) -> Option<Value> {
+        let index = self.values.iter().position(|(c, _)| c == column)?;
+        Some(self.values.swap_remove(index).1)
+    }
+
     /// Builder form of [`Row::set`].
     pub fn with(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
         self.set(column, value);

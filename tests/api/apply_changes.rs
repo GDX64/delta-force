@@ -10,12 +10,10 @@ async fn apply_a_stream_of_inserts_updates_and_deletes() -> anyhow::Result<()> {
                 .nullable("score", DataType::Double),
         )
         .await?;
-    events
-        .write([
-            row! { "id" => 1, "score" => 0.9 },
-            row! { "id" => 2, "score" => 0.5 },
-        ])
-        .await?;
+    let mut batch = events.batch();
+    batch.push(row! { "id" => 1, "score" => 0.9 })?;
+    batch.push(row! { "id" => 2, "score" => 0.5 })?;
+    events.write(batch).await?;
 
     let changes = Changes::in_memory(
         ChangesConfig::new().key("id"),

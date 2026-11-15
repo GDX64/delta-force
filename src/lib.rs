@@ -8,7 +8,9 @@
 //! let events = lake
 //!     .create(TableConfig::new("events").column("id", DataType::Long))
 //!     .await?;
-//! events.write([row! { "id" => 1 }]).await?;
+//! let mut batch = events.batch();
+//! batch.push(row! { "id" => 1 })?;
+//! events.write(batch).await?;
 //! for row in events.rows().await? {
 //!     let id: i64 = row.get("id")?;
 //! }
@@ -17,6 +19,7 @@
 //! ```
 //!
 //! Parquet, Arrow and the storage layer stay internal.
+mod batch;
 mod changes;
 mod delta;
 mod engine;
@@ -25,6 +28,7 @@ mod lake;
 mod row;
 mod sync_store;
 
+pub use batch::RowBatch;
 pub use changes::{ApplyMode, Change, Changes, ChangesConfig};
 pub use error::{Error, Result};
 pub use lake::{APPLY_BATCH, Applied, DataType, DeltaForce, Table, TableConfig};
