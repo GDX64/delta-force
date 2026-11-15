@@ -20,6 +20,7 @@ use delta_kernel::{
 };
 use url::Url;
 
+use crate::compression::{self, Compression};
 use crate::engine::ObjectStoreEngine;
 
 const ENGINE_INFO: &str = concat!("delta-force/", env!("CARGO_PKG_VERSION"));
@@ -74,6 +75,13 @@ impl DeltaTable {
         }
     }
 
+    /// The codec new data files use: the table's stored setting, or the
+    /// default for tables without one.
+    pub fn compression(&self) -> anyhow::Result<Compression> {
+        let snapshot = self.snapshot()?;
+        Ok(compression_of(&snapshot))
+    }
+
     /// The table's schema at its latest version.
     pub fn arrow_schema(&self) -> anyhow::Result<Schema> {
         Ok(self.snapshot()?.schema().as_ref().try_into_arrow()?)
@@ -81,7 +89,7 @@ impl DeltaTable {
 
     /// Create the table with the given schema. Returns the new version (0).
     /// Fails if the table already exists.
-    pub fn create(&self, schema: &Schema) -> anyhow::Result<u64> {
+    pub fn create(&self, schema: &Schema, compression: Compression) -> anyhow::Result<u64> {
         // The kernel requires a local table directory to exist up front.
         if self.url.scheme() == "file" {
             let dir = self
@@ -93,7 +101,10 @@ impl DeltaTable {
         let schema = Arc::new(StructType::try_from_arrow(schema)?);
         let result = create_table(self.url.as_str(), schema, ENGINE_INFO, true)
             // Updates and deletes are recorded as deletion vectors (merge-on-read).
-            .with_table_properties([("delta.enableDeletionVectors", "true")])
+            .with_table_properties([
+                ("delta.enableDeletionVectors", "true"),
+                compression.property(),
+            ])
             .build(self.engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(self.engine.as_ref())?;
         committed_version(result)
@@ -102,13 +113,14 @@ impl DeltaTable {
     /// Append a batch as a new Parquet file in one commit. Returns the version.
     pub fn write(&self, batch: RecordBatch) -> anyhow::Result<u64> {
         let engine = self.engine.as_ref();
-        let mut txn = self
-            .snapshot()?
+        let snapshot = self.snapshot()?;
+        let compression = compression_of(&snapshot);
+        let mut txn = snapshot
             .update_table(UpdateTableOperation::Write, ENGINE_INFO, true)
             .build(engine, Box::new(FileSystemCommitter::new()))?;
 
         let context = txn.write_state()?.write_context_builder().build()?;
-        txn.add_files(engine.write_data_file(batch, &context)?);
+        txn.add_files(engine.write_data_file(batch, &context, compression)?);
 
         committed_version(txn.commit(engine)?)
     }
@@ -127,6 +139,7 @@ impl DeltaTable {
         if plan.deletes.is_empty() && plan.append.is_none() {
             return Ok(None);
         }
+        let compression = compression_of(&snapshot);
         let commit = || -> anyhow::Result<u64> {
             let engine = self.engine.as_ref();
             let mut txn = snapshot
@@ -159,7 +172,7 @@ impl DeltaTable {
                 )?;
             }
             if let Some(batch) = plan.append {
-                txn.add_files(engine.write_data_file(batch, &context)?);
+                txn.add_files(engine.write_data_file(batch, &context, compression)?);
             }
             committed_version(txn.commit(engine)?)
         };
@@ -243,6 +256,16 @@ fn committed_version<S: std::fmt::Debug>(result: CommitResult<S>) -> anyhow::Res
     }
 }
 
+/// The compression stored in the snapshot's table properties.
+fn compression_of(snapshot: &Snapshot) -> Compression {
+    snapshot
+        .table_properties()
+        .unknown_properties
+        .get(compression::PROPERTY)
+        .and_then(|name| Compression::from_name(name))
+        .unwrap_or_default()
+}
+
 /// Whether a snapshot error just means "there is no table here".
 fn is_missing_table(e: &delta_kernel::KernelError) -> bool {
     matches!(
@@ -295,16 +318,16 @@ mod tests {
     #[test]
     fn create_fails_if_the_table_already_exists() {
         let (_dir, table) = new_table();
-        assert_eq!(table.create(&id_schema()).unwrap(), 0);
+        assert_eq!(table.create(&id_schema(), Compression::default()).unwrap(), 0);
 
-        assert!(table.create(&id_schema()).is_err());
+        assert!(table.create(&id_schema(), Compression::default()).is_err());
         assert_eq!(table.version().unwrap(), Some(0));
     }
 
     #[test]
     fn write_commits_new_versions_and_read_returns_them() {
         let (_dir, table) = new_table();
-        table.create(&id_schema()).unwrap();
+        table.create(&id_schema(), Compression::default()).unwrap();
 
         assert_eq!(table.write(ids(vec![1, 2, 3])).unwrap(), 1);
         assert_eq!(table.write(ids(vec![4])).unwrap(), 2);
@@ -318,7 +341,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("table");
         let table = local(&path);
-        table.create(&id_schema()).unwrap();
+        table.create(&id_schema(), Compression::default()).unwrap();
         table.write(ids(vec![7])).unwrap();
 
         let reopened = local(&path);
@@ -329,7 +352,7 @@ mod tests {
     #[test]
     fn works_on_an_in_memory_store() {
         let table = table_at(Arc::new(InMemory::new()), Url::parse("memory:///").unwrap());
-        table.create(&id_schema()).unwrap();
+        table.create(&id_schema(), Compression::default()).unwrap();
         table.write(ids(vec![1, 2])).unwrap();
 
         assert_eq!(table.read().unwrap()[0].num_rows(), 2);
@@ -338,7 +361,35 @@ mod tests {
     #[tokio::test]
     async fn can_be_used_from_inside_an_async_runtime() {
         let (_dir, table) = new_table();
-        table.create(&id_schema()).unwrap();
+        table.create(&id_schema(), Compression::default()).unwrap();
         assert_eq!(table.write(ids(vec![1])).unwrap(), 1);
+    }
+
+    /// The codec of the first column chunk of every data file in `dir`.
+    fn codecs_in(dir: &std::path::Path) -> Vec<delta_kernel::parquet::basic::Compression> {
+        use delta_kernel::parquet::file::reader::{FileReader, SerializedFileReader};
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .map(|p| {
+                let reader = SerializedFileReader::new(std::fs::File::open(p).unwrap()).unwrap();
+                reader.metadata().row_group(0).column(0).compression()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn data_files_use_the_table_compression() {
+        let dir = TempDir::new().unwrap();
+        for compression in [Compression::Snappy, Compression::Zstd] {
+            let path = dir.path().join(compression.to_string());
+            let table = local(&path);
+            table.create(&id_schema(), compression).unwrap();
+            table.write(ids(vec![1, 2, 3])).unwrap();
+
+            assert_eq!(table.compression().unwrap(), compression);
+            assert_eq!(codecs_in(&path), [compression.codec()]);
+        }
     }
 }

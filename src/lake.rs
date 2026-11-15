@@ -16,7 +16,7 @@ use crate::changes::plan;
 use crate::delta::{DeltaTable, MergePlan};
 use crate::Changes;
 use crate::engine::ObjectStoreEngine;
-use crate::{Error, Result, Row, Rows, Value};
+use crate::{Compression, Error, Result, Row, Rows, Value};
 
 /// How a column is stored in the table (Delta's own types).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,11 +76,12 @@ pub(crate) struct Column {
 pub struct TableConfig {
     name: String,
     columns: Vec<Column>,
+    compression: Compression,
 }
 
 impl TableConfig {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), columns: Vec::new() }
+        Self { name: name.into(), columns: Vec::new(), compression: Compression::default() }
     }
 
     /// A column that must always have a value.
@@ -91,6 +92,12 @@ impl TableConfig {
     /// A column that may be null.
     pub fn nullable(self, name: impl Into<String>, data_type: DataType) -> Self {
         self.add(name.into(), data_type, true)
+    }
+
+    /// How data files are compressed. Defaults to [`Compression::Zstd`].
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     fn add(mut self, name: String, data_type: DataType, nullable: bool) -> Self {
@@ -132,28 +139,29 @@ impl DeltaForce {
         let table = self.delta_table(&config.name)?;
         let schema = arrow_schema(&config.columns);
         let columns: Arc<[Column]> = config.columns.into();
+        let compression = config.compression;
         let name = config.name.clone();
         let inner = blocking(move || {
             if table.version()?.is_some() {
                 return Err(Error::TableExists(name));
             }
-            table.create(&schema)?;
+            table.create(&schema, compression)?;
             Ok(table)
         })
         .await?;
-        Ok(Table { name: config.name, inner, columns })
+        Ok(Table { name: config.name, inner, columns, compression })
     }
 
     /// Open an existing table. Fails with [`Error::TableNotFound`] if missing.
     pub async fn table(&self, name: &str) -> Result<Table> {
         let inner = self.delta_table(name)?;
         let (probe, owned) = (inner.clone(), name.to_owned());
-        let columns = blocking(move || match probe.version()? {
-            Some(_) => table_columns(&probe.arrow_schema()?),
+        let (columns, compression) = blocking(move || match probe.version()? {
+            Some(_) => Ok((table_columns(&probe.arrow_schema()?)?, probe.compression()?)),
             None => Err(Error::TableNotFound(owned)),
         })
         .await?;
-        Ok(Table { name: name.to_owned(), inner, columns: columns.into() })
+        Ok(Table { name: name.to_owned(), inner, columns: columns.into(), compression })
     }
 
     fn delta_table(&self, name: &str) -> Result<DeltaTable> {
@@ -177,11 +185,17 @@ pub struct Table {
     inner: DeltaTable,
     /// The schema as of when the table was opened or created.
     columns: Arc<[Column]>,
+    compression: Compression,
 }
 
 impl Table {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// How new data files are compressed.
+    pub fn compression(&self) -> Compression {
+        self.compression
     }
 
     /// The latest committed version.

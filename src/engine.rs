@@ -25,12 +25,14 @@ use delta_kernel::engine::arrow_utils::{
     json_arrow_schema, ordering_needs_row_indexes, parquet_read_plan, parse_json, to_json_bytes,
 };
 use delta_kernel::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use delta_kernel::engine::{reader_options, writer_options};
+use delta_kernel::engine::reader_options;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReaderBuilder,
 };
-use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+use delta_kernel::parquet::arrow::arrow_writer::{ArrowWriter, ArrowWriterOptions};
+use delta_kernel::parquet::basic::Compression as Codec;
+use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::schema::{SchemaRef, StructType};
 use delta_kernel::transaction::BoundWriteContext;
 use delta_kernel::{
@@ -45,6 +47,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use url::Url;
 
+use crate::compression::Compression;
 use crate::sync_store::SyncObjectStore;
 
 /// An [`Engine`] that reads and writes through an [`ObjectStore`].
@@ -75,6 +78,7 @@ impl ObjectStoreEngine {
         &self,
         batch: RecordBatch,
         context: &BoundWriteContext,
+        compression: Compression,
     ) -> KernelResult<Box<dyn EngineData>> {
         // Logical -> physical (column mapping, partition columns, ...).
         let input_schema = StructType::try_from_arrow(batch.schema().as_ref())?;
@@ -99,9 +103,8 @@ impl ObjectStoreEngine {
             dir.set_path(&format!("{}/", dir.path()));
         }
         let location = dir.join(&format!("{}.parquet", uuid::Uuid::new_v4()))?;
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(physical));
         self.parquet
-            .write_parquet_file(location.clone(), Box::new(std::iter::once(Ok(data))))?;
+            .write_batches(&location, &[physical], compression.codec())?;
         let meta = self.storage.head(&location)?;
 
         build_add_file_metadata(DataFileMetadata::new(meta, stats), context)
@@ -299,6 +302,34 @@ pub struct StoreParquet {
     io: SyncObjectStore,
 }
 
+impl StoreParquet {
+    /// Write `batches` as one Parquet file at `location` using `codec`.
+    fn write_batches(
+        &self,
+        location: &Url,
+        batches: &[RecordBatch],
+        codec: Codec,
+    ) -> KernelResult<FileSize> {
+        let first = batches
+            .first()
+            .ok_or_else(|| KernelError::generic("cannot write a parquet file with no data"))?;
+        let properties = WriterProperties::builder().set_compression(codec).build();
+        let options = ArrowWriterOptions::new()
+            .with_skip_arrow_metadata(true)
+            .with_properties(properties);
+
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new_with_options(&mut buffer, first.schema(), options)?;
+        for batch in batches {
+            writer.write(batch)?;
+        }
+        writer.close()?; // writes the footer
+        let size = buffer.len() as FileSize;
+        put(&self.io, location, buffer.into(), true)?;
+        Ok(size)
+    }
+}
+
 impl ParquetHandler for StoreParquet {
     fn read_parquet_files(
         &self,
@@ -350,20 +381,7 @@ impl ParquetHandler for StoreParquet {
         let batches = data
             .map(|b| Ok((*ArrowEngineData::try_from_engine_data(b?)?).into()))
             .collect::<KernelResult<Vec<RecordBatch>>>()?;
-        let first = batches
-            .first()
-            .ok_or_else(|| KernelError::generic("cannot write a parquet file with no data"))?;
-
-        let mut buffer = Vec::new();
-        let mut writer =
-            ArrowWriter::try_new_with_options(&mut buffer, first.schema(), writer_options())?;
-        for batch in &batches {
-            writer.write(batch)?;
-        }
-        writer.close()?; // writes the footer
-        let size = buffer.len() as FileSize;
-        put(&self.io, &location, buffer.into(), true)?;
-        Ok(size)
+        self.write_batches(&location, &batches, Compression::default().codec())
     }
 
     fn read_parquet_footer(&self, file: &FileMeta) -> KernelResult<ParquetFooter> {
