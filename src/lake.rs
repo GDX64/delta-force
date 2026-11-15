@@ -13,6 +13,7 @@ use url::Url;
 
 use crate::batch::{ChangeBatch, RowBatch};
 use crate::changes::plan;
+use crate::stream::RowStream;
 use crate::delta::{DeltaTable, MergePlan};
 use crate::Changes;
 use crate::engine::ObjectStoreEngine;
@@ -283,17 +284,20 @@ impl Table {
         Ok(applied)
     }
 
-    /// All rows at the latest version.
+    /// The rows at the latest version, one batch at a time.
+    pub fn row_stream(&self) -> RowStream {
+        RowStream::new(self.inner.clone())
+    }
+
+    /// All rows at the latest version, in memory. For large tables prefer
+    /// [`Table::row_stream`].
     pub async fn rows(&self) -> Result<Rows> {
-        let inner = self.inner.clone();
-        blocking(move || {
-            let mut rows = Vec::new();
-            for batch in inner.read()? {
-                rows.extend(batch_rows(&batch)?);
-            }
-            Ok(Rows::from(rows))
-        })
-        .await
+        let mut stream = self.row_stream();
+        let mut all = Vec::new();
+        while let Some(rows) = stream.next().await? {
+            all.extend(rows);
+        }
+        Ok(Rows::from(all))
     }
 }
 
@@ -352,7 +356,7 @@ fn table_columns(schema: &Schema) -> Result<Vec<Column>> {
 
 // ------------------------------------------------------------ arrow -> rows --
 
-fn batch_rows(batch: &RecordBatch) -> Result<Vec<Row>> {
+pub(crate) fn batch_rows(batch: &RecordBatch) -> Result<Vec<Row>> {
     let schema = batch.schema();
     let mut rows = vec![Row::new(); batch.num_rows()];
     for (field, array) in schema.fields().iter().zip(batch.columns()) {

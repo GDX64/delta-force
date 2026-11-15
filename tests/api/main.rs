@@ -5,3 +5,4 @@
 mod apply_changes;
 mod compression;
 mod create_and_write;
+mod stream_rows;

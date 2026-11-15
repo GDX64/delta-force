@@ -27,6 +27,7 @@ mod engine;
 mod error;
 mod lake;
 mod row;
+mod stream;
 mod sync_store;
 
 pub use batch::{ChangeBatch, RowBatch};
@@ -35,3 +36,4 @@ pub use compression::Compression;
 pub use error::{Error, Result};
 pub use lake::{Applied, DataType, DeltaForce, Table, TableConfig};
 pub use row::{FromValue, Row, Rows, Value};
+pub use stream::RowStream;

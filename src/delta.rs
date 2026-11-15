@@ -233,16 +233,28 @@ impl DeltaTable {
         Ok((snapshot, metadata, files))
     }
 
-    fn collect(&self, scan: &delta_kernel::scan::Scan) -> anyhow::Result<Vec<RecordBatch>> {
-        scan.execute(self.engine.clone())?
-            .map(|data| Ok(RecordBatch::from(ArrowEngineData::try_from_engine_data(data?)?)))
-            .collect()
+    /// Scan the latest version one batch at a time, handing each to `f`.
+    /// Stops early when `f` returns `false`.
+    pub fn scan(&self, mut f: impl FnMut(RecordBatch) -> bool) -> anyhow::Result<()> {
+        let scan = self.snapshot()?.scan_builder().build()?;
+        for data in scan.execute(self.engine.clone())? {
+            let batch = RecordBatch::from(ArrowEngineData::try_from_engine_data(data?)?);
+            if !f(batch) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Read the whole table at its latest version.
+    #[cfg(test)]
     pub fn read(&self) -> anyhow::Result<Vec<RecordBatch>> {
-        let scan = self.snapshot()?.scan_builder().build()?;
-        self.collect(&scan)
+        let mut batches = Vec::new();
+        self.scan(|batch| {
+            batches.push(batch);
+            true
+        })?;
+        Ok(batches)
     }
 }
 
