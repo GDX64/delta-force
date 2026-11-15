@@ -12,12 +12,12 @@ use futures_util::StreamExt;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
+use crate::Changes;
 use crate::batch::{ChangeBatch, RowBatch, split_rows};
 use crate::changes::plan;
-use crate::stream::RowStream;
-use crate::delta::{DeltaTable, MergePlan, Settings, StagedFile};
-use crate::Changes;
+use crate::delta::{Append, DeltaTable, MergePlan, Settings};
 use crate::engine::ObjectStoreEngine;
+use crate::stream::RowStream;
 use crate::{Compression, Error, LakeFile, Result, Row, Rows, Value};
 
 /// How a column is stored in the table (Delta's own types).
@@ -83,7 +83,11 @@ pub struct TableConfig {
 
 impl TableConfig {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), columns: Vec::new(), settings: Settings::default() }
+        Self {
+            name: name.into(),
+            columns: Vec::new(),
+            settings: Settings::default(),
+        }
     }
 
     /// A column that must always have a value.
@@ -112,7 +116,11 @@ impl TableConfig {
     }
 
     fn add(mut self, name: String, data_type: DataType, nullable: bool) -> Self {
-        self.columns.push(Column { name, data_type, nullable });
+        self.columns.push(Column {
+            name,
+            data_type,
+            nullable,
+        });
         self
     }
 }
@@ -149,7 +157,11 @@ impl DeltaForce {
     }
 
     fn with_store(store: Arc<dyn ObjectStore>, root: Url) -> Self {
-        Self { engine: Arc::new(ObjectStoreEngine::new(store.clone())), store, root }
+        Self {
+            engine: Arc::new(ObjectStoreEngine::new(store.clone())),
+            store,
+            root,
+        }
     }
 
     /// A file in the lake, by its path relative to the lake root (for
@@ -170,7 +182,9 @@ impl DeltaForce {
     pub async fn create(&self, config: TableConfig) -> Result<Table> {
         validate_columns(&config.columns)?;
         if config.settings.rows_per_file == 0 {
-            return Err(Error::InvalidConfig("rows_per_file must be at least 1".into()));
+            return Err(Error::InvalidConfig(
+                "rows_per_file must be at least 1".into(),
+            ));
         }
         let table = self.delta_table(&config.name)?;
         let schema = arrow_schema(&config.columns);
@@ -185,7 +199,12 @@ impl DeltaForce {
             Ok(table)
         })
         .await?;
-        Ok(Table { name: config.name, inner, columns, settings })
+        Ok(Table {
+            name: config.name,
+            inner,
+            columns,
+            settings,
+        })
     }
 
     /// Open an existing table. Fails with [`Error::TableNotFound`] if missing.
@@ -203,12 +222,19 @@ impl DeltaForce {
             None => Err(Error::TableNotFound(owned)),
         })
         .await?;
-        Ok(Table { name: name.to_owned(), inner, columns: columns.into(), settings })
+        Ok(Table {
+            name: name.to_owned(),
+            inner,
+            columns: columns.into(),
+            settings,
+        })
     }
 
     fn delta_table(&self, name: &str) -> Result<DeltaTable> {
         let valid = !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
         if !valid {
             return Err(Error::InvalidTableName(name.to_owned()));
         }
@@ -269,34 +295,27 @@ impl Table {
             return Err(Error::NoRows);
         }
         let rows_per_file = self.settings.rows_per_file;
+        let inner = self.inner.clone();
+        let mut append = blocking(move || Ok(inner.append()?)).await?;
         let mut rows = batch.into_stream();
-        let (mut pending, mut files) = (Vec::new(), Vec::new());
+        let (mut pending, mut files) = (Vec::new(), 0);
         while let Some(batch) = rows.next().await {
             pending.push(batch?);
             while row_count(&pending) >= rows_per_file {
                 let (file, rest) = split_rows(&pending, rows_per_file);
                 pending = rest;
-                files.push(self.write_file(file).await?);
+                append = write_file(append, file).await?;
+                files += 1;
             }
         }
         if row_count(&pending) > 0 {
-            files.push(self.write_file(pending).await?);
+            append = write_file(append, pending).await?;
+            files += 1;
         }
-        if files.is_empty() {
+        if files == 0 {
             return Err(Error::NoRows);
         }
-        let inner = self.inner.clone();
-        blocking(move || Ok(inner.commit_files(files)?)).await
-    }
-
-    /// Write `rows` as one data file, uncommitted.
-    async fn write_file(&self, rows: Vec<RecordBatch>) -> Result<StagedFile> {
-        let inner = self.inner.clone();
-        blocking(move || {
-            let batch = concat_batches(&rows[0].schema(), &rows).map_err(|e| Error::Storage(e.into()))?;
-            Ok(inner.stage(batch)?)
-        })
-        .await
+        blocking(move || Ok(append.commit()?)).await
     }
 
     /// An empty change batch for this table's columns. Fill it with
@@ -342,7 +361,11 @@ impl Table {
                     let plan = plan(existing, &batch, &key)?;
                     let mut merge = MergePlan::default();
                     for (index, position) in plan.delete {
-                        merge.deletes.entry(files[index].path.clone()).or_default().push(position);
+                        merge
+                            .deletes
+                            .entry(files[index].path.clone())
+                            .or_default()
+                            .push(position);
                     }
                     if !plan.append.is_empty() {
                         let mut rows = RowBatch::new(columns.into());
@@ -397,14 +420,19 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 
 fn validate_columns(columns: &[Column]) -> Result<()> {
     if columns.is_empty() {
-        return Err(Error::InvalidSchema("a table needs at least one column".into()));
+        return Err(Error::InvalidSchema(
+            "a table needs at least one column".into(),
+        ));
     }
     for (i, c) in columns.iter().enumerate() {
         if c.name.is_empty() {
             return Err(Error::InvalidSchema("column names cannot be empty".into()));
         }
         if columns[..i].iter().any(|p| p.name == c.name) {
-            return Err(Error::InvalidSchema(format!("duplicate column {:?}", c.name)));
+            return Err(Error::InvalidSchema(format!(
+                "duplicate column {:?}",
+                c.name
+            )));
         }
     }
     Ok(())
@@ -425,9 +453,17 @@ fn table_columns(schema: &Schema) -> Result<Vec<Column>> {
         .iter()
         .map(|f| {
             let data_type = DataType::from_arrow(f.data_type()).ok_or_else(|| {
-                Error::InvalidSchema(format!("unsupported type {} for {:?}", f.data_type(), f.name()))
+                Error::InvalidSchema(format!(
+                    "unsupported type {} for {:?}",
+                    f.data_type(),
+                    f.name()
+                ))
             })?;
-            Ok(Column { name: f.name().clone(), data_type, nullable: f.is_nullable() })
+            Ok(Column {
+                name: f.name().clone(),
+                data_type,
+                nullable: f.is_nullable(),
+            })
         })
         .collect()
 }
@@ -439,10 +475,24 @@ pub(crate) fn batch_rows(batch: &RecordBatch) -> Result<Vec<Row>> {
     let mut rows = vec![Row::new(); batch.num_rows()];
     for (field, array) in schema.fields().iter().zip(batch.columns()) {
         for (i, row) in rows.iter_mut().enumerate() {
-            row.set(field.name().clone(), value_at(array.as_ref(), i, field.name())?);
+            row.set(
+                field.name().clone(),
+                value_at(array.as_ref(), i, field.name())?,
+            );
         }
     }
     Ok(rows)
+}
+
+/// Write `rows` as one data file of `append`, uncommitted.
+async fn write_file(mut append: Append, rows: Vec<RecordBatch>) -> Result<Append> {
+    blocking(move || {
+        let batch =
+            concat_batches(&rows[0].schema(), &rows).map_err(|e| Error::Storage(e.into()))?;
+        append.write_file(batch)?;
+        Ok(append)
+    })
+    .await
 }
 
 fn row_count(batches: &[RecordBatch]) -> usize {
@@ -462,7 +512,9 @@ pub(crate) fn value_at(array: &dyn Array, i: usize, column: &str) -> Result<Valu
         ArrowType::LargeUtf8 => Value::String(array.as_string::<i64>().value(i).to_owned()),
         ArrowType::Utf8View => Value::String(array.as_string_view().value(i).to_owned()),
         other => {
-            return Err(Error::InvalidSchema(format!("unsupported type {other} for {column:?}")));
+            return Err(Error::InvalidSchema(format!(
+                "unsupported type {other} for {column:?}"
+            )));
         }
     })
 }
@@ -474,7 +526,9 @@ mod tests {
     #[tokio::test]
     async fn pushed_files_are_split_into_data_files_of_rows_per_file() {
         let lake = DeltaForce::in_memory();
-        let config = TableConfig::new("t").column("id", DataType::Long).rows_per_file(2);
+        let config = TableConfig::new("t")
+            .column("id", DataType::Long)
+            .rows_per_file(2);
         let table = lake.create(config).await.unwrap();
         lake.put_file("a.csv", "id\n1\n2\n3\n").await.unwrap();
         lake.put_file("b.csv", "id\n4\n5\n6\n").await.unwrap();
@@ -493,12 +547,20 @@ mod tests {
     #[tokio::test]
     async fn pushed_files_are_read_only_on_write() {
         let lake = DeltaForce::in_memory();
-        let table = lake.create(TableConfig::new("t").column("id", DataType::Long)).await.unwrap();
+        let table = lake
+            .create(TableConfig::new("t").column("id", DataType::Long))
+            .await
+            .unwrap();
         let mut batch = table.batch();
         batch.push_file(&lake.file("later.csv")); // doesn't exist yet
-        lake.put_file("later.csv", "id
+        lake.put_file(
+            "later.csv",
+            "id
 1
-").await.unwrap();
+",
+        )
+        .await
+        .unwrap();
         assert_eq!(table.write(batch).await.unwrap(), 1);
 
         let mut batch = table.batch();
@@ -511,12 +573,58 @@ mod tests {
     #[tokio::test]
     async fn files_without_rows_write_nothing() {
         let lake = DeltaForce::in_memory();
-        let table = lake.create(TableConfig::new("t").column("id", DataType::Long)).await.unwrap();
-        lake.put_file("empty.csv", "id
-").await.unwrap();
+        let table = lake
+            .create(TableConfig::new("t").column("id", DataType::Long))
+            .await
+            .unwrap();
+        lake.put_file(
+            "empty.csv",
+            "id
+",
+        )
+        .await
+        .unwrap();
         let mut batch = table.batch();
         batch.push_file(&lake.file("empty.csv"));
         assert!(matches!(table.write(batch).await, Err(Error::NoRows)));
+    }
+
+    #[tokio::test]
+    async fn write_reads_the_log_once_however_many_files() {
+        let store = crate::test_util::TestStore::new(InMemory::new());
+        let lake = DeltaForce::with_test_store(store.clone());
+        let config = TableConfig::new("t")
+            .column("id", DataType::Long)
+            .rows_per_file(2);
+        let table = lake.create(config).await.unwrap();
+        lake.put_file(
+            "ids.csv",
+            "id
+1 
+2
+3
+4
+5
+",
+        )
+        .await
+        .unwrap();
+        let log_gets = || -> u64 {
+            let stats = store.stats();
+            stats
+                .files
+                .iter()
+                .filter(|(path, _)| path.contains("_delta_log/"))
+                .map(|(_, f)| f.reads.gets)
+                .sum()
+        };
+
+        let before = log_gets();
+        let mut batch = table.batch();
+        batch.push_file(&lake.file("ids.csv")); // 3 data files
+        table.write(batch).await.unwrap();
+        assert_eq!(log_gets() - before, 1);
+        assert_eq!(table.inner.file_rows().unwrap().len(), 3);
     }
 
     #[test]
@@ -526,7 +634,10 @@ mod tests {
             RecordBatch::try_from_iter([("id", array)]).unwrap()
         };
         let (head, tail) = crate::batch::split_rows(&[ids(vec![1, 2]), ids(vec![3, 4, 5])], 3);
-        assert_eq!(head.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(
+            head.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            [2, 1]
+        );
         assert_eq!(tail.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), [2]);
     }
 }

@@ -46,7 +46,8 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 - Lazy: building a batch does no I/O. `push_file` only records the file;
   `RowBatch::into_stream` reads files as they are pulled. `write` pulls that
   stream, writes a data file every `rows_per_file` rows (default 4M), and
-  commits them all in one commit. Zstd by default.
+  commits them all in one commit. One snapshot (`DeltaTable::append`) serves
+  the whole write, so the log is read once. Zstd by default.
 
 ## Conventions
 

@@ -223,7 +223,11 @@ impl ObjectStore for TestStore {
         self.read_only(location)?;
         let inner = self.inner.put_multipart_opts(location, opts).await?;
         self.count(location, |f| f.writes.puts += 1);
-        Ok(Box::new(CountedUpload { inner, store: self.clone(), location: location.clone() }))
+        Ok(Box::new(CountedUpload {
+            inner,
+            store: self.clone(),
+            location: location.clone(),
+        }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {

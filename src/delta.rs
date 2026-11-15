@@ -16,7 +16,10 @@ use delta_kernel::{
     engine::arrow_data::ArrowEngineData,
     scan::{ScanMetadata, state::{ScanFile, transform_to_logical}},
     schema::StructType,
-    transaction::{CommitResult, UpdateTableOperation, create_table::create_table},
+    transaction::{
+        BoundWriteContext, CommitResult, Transaction, UpdateTableOperation,
+        create_table::create_table,
+    },
 };
 use url::Url;
 
@@ -60,11 +63,28 @@ pub(crate) struct MergePlan {
     pub append: Option<RecordBatch>,
 }
 
-/// A data file written to the table's directory but not committed yet:
-/// readers can't see it until [`DeltaTable::commit_files`] adds it.
-pub(crate) struct StagedFile {
-    /// The kernel's "add file" metadata for it.
-    add: RecordBatch,
+/// An append in progress: one snapshot of the table and one transaction.
+/// Data files written with [`Append::write_file`] stay invisible until
+/// [`Append::commit`] adds them all in one commit.
+pub(crate) struct Append {
+    engine: Arc<ObjectStoreEngine>,
+    txn: Transaction,
+    context: BoundWriteContext,
+    compression: Compression,
+}
+
+impl Append {
+    /// Write `batch` as a data file of this append, uncommitted.
+    pub fn write_file(&mut self, batch: RecordBatch) -> anyhow::Result<()> {
+        let add = self.engine.write_data_file(batch, &self.context, self.compression)?;
+        self.txn.add_files(add);
+        Ok(())
+    }
+
+    /// Commit every data file written so far. Returns the version.
+    pub fn commit(self) -> anyhow::Result<u64> {
+        committed_version(self.txn.commit(self.engine.as_ref())?)
+    }
 }
 
 /// A Delta table: a directory of data files plus a `_delta_log/` of commits.
@@ -148,35 +168,21 @@ impl DeltaTable {
     /// Append a batch as a new Parquet file in one commit. Returns the version.
     #[cfg(test)]
     pub fn write(&self, batch: RecordBatch) -> anyhow::Result<u64> {
-        let staged = self.stage(batch)?;
-        self.commit_files(vec![staged])
+        let mut append = self.append()?;
+        append.write_file(batch)?;
+        append.commit()
     }
 
-    /// Write `batch` as a data file without committing it.
-    pub fn stage(&self, batch: RecordBatch) -> anyhow::Result<StagedFile> {
-        let engine = self.engine.as_ref();
+    /// Start an append: the log is read once, here, for every data file
+    /// written and for the commit.
+    pub fn append(&self) -> anyhow::Result<Append> {
         let snapshot = self.snapshot()?;
         let compression = compression_of(&snapshot);
-        // A transaction only to get the write context; it's never committed.
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, ENGINE_INFO, true)
-            .build(engine, Box::new(FileSystemCommitter::new()))?;
+            .build(self.engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let context = txn.write_state()?.write_context_builder().build()?;
-        let add = engine.write_data_file(batch, &context, compression)?;
-        Ok(StagedFile { add: RecordBatch::from(ArrowEngineData::try_from_engine_data(add)?) })
-    }
-
-    /// Commit staged data files together, in one commit. Returns the version.
-    pub fn commit_files(&self, files: Vec<StagedFile>) -> anyhow::Result<u64> {
-        let engine = self.engine.as_ref();
-        let mut txn = self
-            .snapshot()?
-            .update_table(UpdateTableOperation::Write, ENGINE_INFO, true)
-            .build(engine, Box::new(FileSystemCommitter::new()))?;
-        for file in files {
-            txn.add_files(Box::new(ArrowEngineData::new(file.add)));
-        }
-        committed_version(txn.commit(engine)?)
+        Ok(Append { engine: self.engine.clone(), txn, context, compression })
     }
 
     /// Merge-on-read update in one commit. `f` gets every data file's live
