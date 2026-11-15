@@ -43,7 +43,9 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
   `spawn_blocking`.
 - `apply` is merge-on-read: replaced/deleted rows go into deletion vectors,
   new values are appended. One commit per `ChangeBatch`. Strict mode only.
-- One Parquet file per `write`/batch; Zstd by default.
+- Files are pushed as streams: `push_file` writes a data file every
+  `rows_per_file` rows (default 4M) as it reads, uncommitted; `write` commits
+  them all plus what's left in memory, in one commit. Zstd by default.
 
 ## Conventions
 

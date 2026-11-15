@@ -14,7 +14,7 @@ use url::Url;
 use crate::batch::{ChangeBatch, RowBatch};
 use crate::changes::plan;
 use crate::stream::RowStream;
-use crate::delta::{DeltaTable, MergePlan};
+use crate::delta::{DeltaTable, MergePlan, Settings};
 use crate::Changes;
 use crate::engine::ObjectStoreEngine;
 use crate::{Compression, Error, LakeFile, Result, Row, Rows, Value};
@@ -77,12 +77,12 @@ pub(crate) struct Column {
 pub struct TableConfig {
     name: String,
     columns: Vec<Column>,
-    compression: Compression,
+    settings: Settings,
 }
 
 impl TableConfig {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), columns: Vec::new(), compression: Compression::default() }
+        Self { name: name.into(), columns: Vec::new(), settings: Settings::default() }
     }
 
     /// A column that must always have a value.
@@ -97,7 +97,16 @@ impl TableConfig {
 
     /// How data files are compressed. Defaults to [`Compression::Zstd`].
     pub fn compression(mut self, compression: Compression) -> Self {
-        self.compression = compression;
+        self.settings.compression = compression;
+        self
+    }
+
+    /// The most rows in one data file. While a file is pushed into a
+    /// [`RowBatch`], every `rows` rows are written out as a data file, so
+    /// memory holds at most this many rows; [`Table::write`] commits them
+    /// all together. Defaults to 4,000,000.
+    pub fn rows_per_file(mut self, rows: usize) -> Self {
+        self.settings.rows_per_file = rows;
         self
     }
 
@@ -159,32 +168,41 @@ impl DeltaForce {
     /// Create a new table. Fails with [`Error::TableExists`] if it exists.
     pub async fn create(&self, config: TableConfig) -> Result<Table> {
         validate_columns(&config.columns)?;
+        if config.settings.rows_per_file == 0 {
+            return Err(Error::InvalidConfig("rows_per_file must be at least 1".into()));
+        }
         let table = self.delta_table(&config.name)?;
         let schema = arrow_schema(&config.columns);
         let columns: Arc<[Column]> = config.columns.into();
-        let compression = config.compression;
+        let settings = config.settings;
         let name = config.name.clone();
         let inner = blocking(move || {
             if table.version()?.is_some() {
                 return Err(Error::TableExists(name));
             }
-            table.create(&schema, compression)?;
+            table.create(&schema, settings)?;
             Ok(table)
         })
         .await?;
-        Ok(Table { name: config.name, inner, columns, compression })
+        Ok(Table { name: config.name, inner, columns, settings })
     }
 
     /// Open an existing table. Fails with [`Error::TableNotFound`] if missing.
     pub async fn table(&self, name: &str) -> Result<Table> {
         let inner = self.delta_table(name)?;
         let (probe, owned) = (inner.clone(), name.to_owned());
-        let (columns, compression) = blocking(move || match probe.version()? {
-            Some(_) => Ok((table_columns(&probe.arrow_schema()?)?, probe.compression()?)),
+        let (columns, settings) = blocking(move || match probe.version()? {
+            Some(_) => {
+                let settings = Settings {
+                    compression: probe.compression()?,
+                    rows_per_file: probe.rows_per_file()?,
+                };
+                Ok((table_columns(&probe.arrow_schema()?)?, settings))
+            }
             None => Err(Error::TableNotFound(owned)),
         })
         .await?;
-        Ok(Table { name: name.to_owned(), inner, columns: columns.into(), compression })
+        Ok(Table { name: name.to_owned(), inner, columns: columns.into(), settings })
     }
 
     fn delta_table(&self, name: &str) -> Result<DeltaTable> {
@@ -208,7 +226,7 @@ pub struct Table {
     inner: DeltaTable,
     /// The schema as of when the table was opened or created.
     columns: Arc<[Column]>,
-    compression: Compression,
+    settings: Settings,
 }
 
 impl Table {
@@ -218,7 +236,12 @@ impl Table {
 
     /// How new data files are compressed.
     pub fn compression(&self) -> Compression {
-        self.compression
+        self.settings.compression
+    }
+
+    /// The most rows in one data file. See [`TableConfig::rows_per_file`].
+    pub fn rows_per_file(&self) -> usize {
+        self.settings.rows_per_file
     }
 
     /// The latest committed version.
@@ -230,17 +253,24 @@ impl Table {
     /// An empty batch for this table's columns. Fill it with
     /// [`RowBatch::push`], then hand it to [`Table::write`].
     pub fn batch(&self) -> RowBatch {
-        RowBatch::new(self.columns.clone())
+        RowBatch::for_table(self.columns.clone(), self.inner.clone(), self.settings.rows_per_file)
     }
 
-    /// Append a batch in one commit. Returns the new version.
+    /// Append a batch in one commit, together with any data files it
+    /// already wrote out. Returns the new version.
     pub async fn write(&self, batch: RowBatch) -> Result<u64> {
         if batch.is_empty() {
             return Err(Error::NoRows);
         }
-        let batch = batch.finish()?;
+        let (mut staged, rest) = batch.finish_staged()?;
         let inner = self.inner.clone();
-        blocking(move || Ok(inner.write(batch)?)).await
+        blocking(move || {
+            if let Some(rest) = rest {
+                staged.push(inner.stage(rest)?);
+            }
+            Ok(inner.commit_files(staged)?)
+        })
+        .await
     }
 
     /// An empty change batch for this table's columns. Fill it with
@@ -405,4 +435,40 @@ pub(crate) fn value_at(array: &dyn Array, i: usize, column: &str) -> Result<Valu
             return Err(Error::InvalidSchema(format!("unsupported type {other} for {column:?}")));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pushed_files_are_split_into_data_files_of_rows_per_file() {
+        let lake = DeltaForce::in_memory();
+        let config = TableConfig::new("t").column("id", DataType::Long).rows_per_file(2);
+        let table = lake.create(config).await.unwrap();
+        lake.put_file("a.csv", "id\n1\n2\n3\n").await.unwrap();
+        lake.put_file("b.csv", "id\n4\n5\n6\n").await.unwrap();
+
+        let mut batch = table.batch();
+        batch.push_file(&lake.file("a.csv")).await.unwrap(); // file [1, 2]; 3 left
+        batch.push_file(&lake.file("b.csv")).await.unwrap(); // file [4, 5]; then [3, 6]
+        batch.push(crate::row! { "id" => 7 }).unwrap(); // in memory until write
+        assert_eq!(batch.len(), 7);
+        assert_eq!(table.write(batch).await.unwrap(), 1);
+
+        let mut files = table.inner.file_rows().unwrap();
+        files.sort();
+        assert_eq!(files, [1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn split_rows_slices_across_batches() {
+        let ids = |v: Vec<i64>| {
+            let array: arrow_array::ArrayRef = Arc::new(arrow_array::Int64Array::from(v));
+            RecordBatch::try_from_iter([("id", array)]).unwrap()
+        };
+        let (head, tail) = crate::batch::split_rows(&[ids(vec![1, 2]), ids(vec![3, 4, 5])], 3);
+        assert_eq!(head.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(tail.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), [2]);
+    }
 }

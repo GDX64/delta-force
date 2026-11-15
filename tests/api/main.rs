@@ -8,4 +8,5 @@ mod apply_changes;
 mod compression;
 mod create_and_write;
 mod ingest_to_disk;
+mod rows_per_file;
 mod stream_rows;

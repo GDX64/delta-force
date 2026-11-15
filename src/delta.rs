@@ -24,6 +24,22 @@ use crate::compression::{self, Compression};
 use crate::engine::ObjectStoreEngine;
 
 const ENGINE_INFO: &str = concat!("delta-force/", env!("CARGO_PKG_VERSION"));
+/// Table property: rows per data file when ingesting.
+const ROWS_PER_FILE: &str = "delta-force.rows-per-file";
+pub(crate) const DEFAULT_ROWS_PER_FILE: usize = 4_000_000;
+
+/// Our settings, stored as table properties when a table is created.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Settings {
+    pub compression: Compression,
+    pub rows_per_file: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { compression: Compression::default(), rows_per_file: DEFAULT_ROWS_PER_FILE }
+    }
+}
 
 /// A data file's rows that are still live, as read for a merge.
 pub(crate) struct LiveFile {
@@ -42,6 +58,13 @@ pub(crate) struct MergePlan {
     /// Data file path -> row positions to delete.
     pub deletes: HashMap<String, Vec<u64>>,
     pub append: Option<RecordBatch>,
+}
+
+/// A data file written to the table's directory but not committed yet:
+/// readers can't see it until [`DeltaTable::commit_files`] adds it.
+pub(crate) struct StagedFile {
+    /// The kernel's "add file" metadata for it.
+    add: RecordBatch,
 }
 
 /// A Delta table: a directory of data files plus a `_delta_log/` of commits.
@@ -82,6 +105,17 @@ impl DeltaTable {
         Ok(compression_of(&snapshot))
     }
 
+    /// Rows per data file when ingesting: the stored setting, or the default.
+    pub fn rows_per_file(&self) -> anyhow::Result<usize> {
+        let snapshot = self.snapshot()?;
+        Ok(snapshot
+            .table_properties()
+            .unknown_properties
+            .get(ROWS_PER_FILE)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(DEFAULT_ROWS_PER_FILE))
+    }
+
     /// The table's schema at its latest version.
     pub fn arrow_schema(&self) -> anyhow::Result<Schema> {
         Ok(self.snapshot()?.schema().as_ref().try_into_arrow()?)
@@ -89,7 +123,7 @@ impl DeltaTable {
 
     /// Create the table with the given schema. Returns the new version (0).
     /// Fails if the table already exists.
-    pub fn create(&self, schema: &Schema, compression: Compression) -> anyhow::Result<u64> {
+    pub fn create(&self, schema: &Schema, settings: Settings) -> anyhow::Result<u64> {
         // The kernel requires a local table directory to exist up front.
         if self.url.scheme() == "file" {
             let dir = self
@@ -103,7 +137,8 @@ impl DeltaTable {
             // Updates and deletes are recorded as deletion vectors (merge-on-read).
             .with_table_properties([
                 ("delta.enableDeletionVectors", "true"),
-                compression.property(),
+                settings.compression.property(),
+                (ROWS_PER_FILE, &settings.rows_per_file.to_string()),
             ])
             .build(self.engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(self.engine.as_ref())?;
@@ -111,17 +146,36 @@ impl DeltaTable {
     }
 
     /// Append a batch as a new Parquet file in one commit. Returns the version.
+    #[cfg(test)]
     pub fn write(&self, batch: RecordBatch) -> anyhow::Result<u64> {
+        let staged = self.stage(batch)?;
+        self.commit_files(vec![staged])
+    }
+
+    /// Write `batch` as a data file without committing it.
+    pub fn stage(&self, batch: RecordBatch) -> anyhow::Result<StagedFile> {
         let engine = self.engine.as_ref();
         let snapshot = self.snapshot()?;
         let compression = compression_of(&snapshot);
-        let mut txn = snapshot
+        // A transaction only to get the write context; it's never committed.
+        let txn = snapshot
             .update_table(UpdateTableOperation::Write, ENGINE_INFO, true)
             .build(engine, Box::new(FileSystemCommitter::new()))?;
-
         let context = txn.write_state()?.write_context_builder().build()?;
-        txn.add_files(engine.write_data_file(batch, &context, compression)?);
+        let add = engine.write_data_file(batch, &context, compression)?;
+        Ok(StagedFile { add: RecordBatch::from(ArrowEngineData::try_from_engine_data(add)?) })
+    }
 
+    /// Commit staged data files together, in one commit. Returns the version.
+    pub fn commit_files(&self, files: Vec<StagedFile>) -> anyhow::Result<u64> {
+        let engine = self.engine.as_ref();
+        let mut txn = self
+            .snapshot()?
+            .update_table(UpdateTableOperation::Write, ENGINE_INFO, true)
+            .build(engine, Box::new(FileSystemCommitter::new()))?;
+        for file in files {
+            txn.add_files(Box::new(ArrowEngineData::new(file.add)));
+        }
         committed_version(txn.commit(engine)?)
     }
 
@@ -246,6 +300,13 @@ impl DeltaTable {
         Ok(())
     }
 
+    /// Row count of each data file at the latest version.
+    #[cfg(test)]
+    pub fn file_rows(&self) -> anyhow::Result<Vec<usize>> {
+        let (_, _, files) = self.live_files()?;
+        Ok(files.iter().map(|f| f.positions.len()).collect())
+    }
+
     /// Read the whole table at its latest version.
     #[cfg(test)]
     pub fn read(&self) -> anyhow::Result<Vec<RecordBatch>> {
@@ -330,16 +391,16 @@ mod tests {
     #[test]
     fn create_fails_if_the_table_already_exists() {
         let (_dir, table) = new_table();
-        assert_eq!(table.create(&id_schema(), Compression::default()).unwrap(), 0);
+        assert_eq!(table.create(&id_schema(), Settings::default()).unwrap(), 0);
 
-        assert!(table.create(&id_schema(), Compression::default()).is_err());
+        assert!(table.create(&id_schema(), Settings::default()).is_err());
         assert_eq!(table.version().unwrap(), Some(0));
     }
 
     #[test]
     fn write_commits_new_versions_and_read_returns_them() {
         let (_dir, table) = new_table();
-        table.create(&id_schema(), Compression::default()).unwrap();
+        table.create(&id_schema(), Settings::default()).unwrap();
 
         assert_eq!(table.write(ids(vec![1, 2, 3])).unwrap(), 1);
         assert_eq!(table.write(ids(vec![4])).unwrap(), 2);
@@ -353,7 +414,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("table");
         let table = local(&path);
-        table.create(&id_schema(), Compression::default()).unwrap();
+        table.create(&id_schema(), Settings::default()).unwrap();
         table.write(ids(vec![7])).unwrap();
 
         let reopened = local(&path);
@@ -364,7 +425,7 @@ mod tests {
     #[test]
     fn works_on_an_in_memory_store() {
         let table = table_at(Arc::new(InMemory::new()), Url::parse("memory:///").unwrap());
-        table.create(&id_schema(), Compression::default()).unwrap();
+        table.create(&id_schema(), Settings::default()).unwrap();
         table.write(ids(vec![1, 2])).unwrap();
 
         assert_eq!(table.read().unwrap()[0].num_rows(), 2);
@@ -373,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn can_be_used_from_inside_an_async_runtime() {
         let (_dir, table) = new_table();
-        table.create(&id_schema(), Compression::default()).unwrap();
+        table.create(&id_schema(), Settings::default()).unwrap();
         assert_eq!(table.write(ids(vec![1])).unwrap(), 1);
     }
 
@@ -397,7 +458,7 @@ mod tests {
         for compression in [Compression::Snappy, Compression::Zstd] {
             let path = dir.path().join(compression.to_string());
             let table = local(&path);
-            table.create(&id_schema(), compression).unwrap();
+            table.create(&id_schema(), Settings { compression, ..Default::default() }).unwrap();
             table.write(ids(vec![1, 2, 3])).unwrap();
 
             assert_eq!(table.compression().unwrap(), compression);

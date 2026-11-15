@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures_util::stream::{BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
@@ -60,9 +61,11 @@ impl LakeFile {
         Ok(meta.size)
     }
 
-    pub(crate) async fn read(&self) -> Result<Bytes> {
+    /// The file's contents as a stream of chunks, fetched as they are read.
+    pub(crate) async fn chunks(&self) -> Result<BoxStream<'static, Result<Bytes>>> {
         let object = self.store.get(&self.location).await.map_err(|e| self.error(e))?;
-        object.bytes().await.map_err(|e| self.error(e))
+        let this = self.clone();
+        Ok(object.into_stream().map(move |chunk| chunk.map_err(|e| this.error(e))).boxed())
     }
 
     pub(crate) async fn put(&self, contents: Vec<u8>) -> Result<()> {

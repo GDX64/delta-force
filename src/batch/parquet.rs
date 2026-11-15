@@ -2,7 +2,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::ArrayRef;
 use arrow_schema::DataType as ArrowType;
 use bytes::Bytes;
 use delta_kernel::arrow::compute::{CastOptions, cast_with_options};
@@ -12,20 +12,22 @@ use delta_kernel::parquet::arrow::async_reader::AsyncFileReader;
 use delta_kernel::parquet::errors::ParquetError;
 use delta_kernel::parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use futures_util::future::{BoxFuture, FutureExt};
-use futures_util::TryStreamExt;
+use futures_util::StreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 
+use super::Batches;
 use super::columns::{assemble, match_columns};
 use crate::file::LakeFile;
 use crate::lake::{Column, DataType};
 use crate::{Error, Result};
 
-/// Read `file` as Parquet, as batches in the table's columns. Only the
-/// footer and the column data are fetched, with ranged reads.
-pub(super) async fn read(file: &LakeFile, columns: &[Column]) -> Result<Vec<RecordBatch>> {
-    let invalid = |message: String| Error::InvalidFile { file: file.path().to_owned(), message };
-    let storage = |e: delta_kernel::parquet::errors::ParquetError| Error::Storage(e.into());
+/// Read `file` as Parquet, as a stream of batches in the table's columns.
+/// Only the footer and the column data are fetched, with ranged reads.
+pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Batches> {
+    let path = file.path().to_owned();
+    let invalid = move |message: String| Error::InvalidFile { file: path.clone(), message };
+    let storage = |e: ParquetError| Error::Storage(e.into());
 
     let reader = Reader {
         store: file.store(),
@@ -37,7 +39,7 @@ pub(super) async fn read(file: &LakeFile, columns: &[Column]) -> Result<Vec<Reco
 
     // Check the whole schema from the footer before reading any data.
     let names = schema.fields().iter().map(|f| f.name().as_str());
-    let source = match_columns(names, columns).map_err(invalid)?;
+    let source = match_columns(names, columns).map_err(&invalid)?;
     for (column, source) in columns.iter().zip(&source) {
         if let Some(i) = *source {
             let found = schema.field(i).data_type();
@@ -50,11 +52,11 @@ pub(super) async fn read(file: &LakeFile, columns: &[Column]) -> Result<Vec<Reco
         }
     }
 
+    let columns = columns.clone();
     let stream = builder.build().map_err(storage)?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(storage)?;
-    batches
-        .iter()
-        .map(|batch| {
+    Ok(stream
+        .map(move |batch| {
+            let batch = batch.map_err(storage)?;
             let convert = |i: usize| -> Result<ArrayRef, String> {
                 let target = columns[source.iter().position(|s| *s == Some(i)).unwrap()].data_type;
                 // `safe: false`: a value that doesn't fit is an error, not a null.
@@ -62,10 +64,9 @@ pub(super) async fn read(file: &LakeFile, columns: &[Column]) -> Result<Vec<Reco
                 cast_with_options(batch.column(i), &target.to_arrow(), &options)
                     .map_err(|e| format!("column {:?}: {e}", schema.field(i).name()))
             };
-            assemble(columns, &source, convert, batch.num_rows())
+            assemble(&columns, &source, convert, batch.num_rows()).map_err(&invalid)
         })
-        .collect::<Result<_, String>>()
-        .map_err(invalid)
+        .boxed())
 }
 
 /// Ranged reads of one Parquet file in the lake's store.
@@ -129,6 +130,8 @@ fn fits(found: &ArrowType, target: DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::RecordBatch;
+    use futures_util::TryStreamExt;
     use arrow_array::{Int64Array, StringArray};
     use delta_kernel::parquet::arrow::ArrowWriter;
     use object_store::memory::InMemory;
@@ -148,24 +151,28 @@ mod tests {
         file
     }
 
-    fn id(data_type: DataType) -> Vec<Column> {
-        vec![Column { name: "id".into(), data_type, nullable: false }]
+    fn id(data_type: DataType) -> Arc<[Column]> {
+        vec![Column { name: "id".into(), data_type, nullable: false }].into()
+    }
+
+    async fn read_all(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Vec<RecordBatch>> {
+        read(file, columns).await?.try_collect().await
     }
 
     #[tokio::test]
     async fn incompatible_types_fail_before_reading_data() {
         let file = file_with_id(Arc::new(StringArray::from(vec!["1"]))).await;
-        let error = read(&file, &id(DataType::Long)).await.unwrap_err().to_string();
+        let error = read_all(&file, &id(DataType::Long)).await.unwrap_err().to_string();
         assert!(error.contains("column \"id\": expected long, found Utf8"), "{error}");
     }
 
     #[tokio::test]
     async fn narrowing_checks_every_value() {
         let fits = file_with_id(Arc::new(Int64Array::from(vec![1, 2]))).await;
-        assert_eq!(read(&fits, &id(DataType::Integer)).await.unwrap()[0].num_rows(), 2);
+        assert_eq!(read_all(&fits, &id(DataType::Integer)).await.unwrap()[0].num_rows(), 2);
 
         let overflow = file_with_id(Arc::new(Int64Array::from(vec![1, i64::MAX]))).await;
-        let error = read(&overflow, &id(DataType::Integer)).await.unwrap_err().to_string();
+        let error = read_all(&overflow, &id(DataType::Integer)).await.unwrap_err().to_string();
         assert!(error.contains("f.parquet: column \"id\""), "{error}");
     }
 }
