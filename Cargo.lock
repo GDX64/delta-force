@@ -649,6 +649,7 @@ dependencies = [
  "anyhow",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "bytes",
  "delta_kernel",
  "delta_kernel_default_engine",

@@ -30,6 +30,8 @@ mod lake;
 mod row;
 mod stream;
 mod sync_store;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 
 pub use batch::{ChangeBatch, RowBatch};
 pub use changes::{ApplyMode, Change, Changes, ChangesConfig};
