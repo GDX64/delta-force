@@ -11,7 +11,9 @@ use crate::file::{Format, LakeFile};
 use crate::lake::{Column, DataType, arrow_schema, value_at};
 use crate::{Change, Error, Result, Row, Value};
 
+mod columns;
 mod csv;
+mod parquet;
 
 /// Rows to write to a table, stored column by column as they are pushed.
 ///
@@ -29,12 +31,14 @@ impl RowBatch {
     }
 
     /// Add every row of a file in the lake. The format comes from the
-    /// extension (`.csv` for now). Columns are matched by header name,
+    /// extension: `.csv` or `.parquet`. Columns are matched by name,
     /// ignoring case and order; missing nullable columns are null and empty
-    /// CSV fields are null. On error the batch is unchanged.
+    /// CSV fields are null. Parquet types are converted where they fit
+    /// (`int32` into `long`, ...). On error the batch is unchanged.
     pub async fn push_file(&mut self, file: &LakeFile) -> Result<()> {
         let chunks = match file.format()? {
             Format::Csv => csv::read(file, &self.builders.columns).await?,
+            Format::Parquet => parquet::read(file, &self.builders.columns).await?,
         };
         self.chunks.extend(chunks);
         Ok(())

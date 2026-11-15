@@ -21,6 +21,7 @@ pub struct LakeFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Format {
     Csv,
+    Parquet,
 }
 
 impl LakeFile {
@@ -41,8 +42,22 @@ impl LakeFile {
         let extension = self.path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
         match extension.as_deref() {
             Some("csv") => Ok(Format::Csv),
+            Some("parquet") => Ok(Format::Parquet),
             _ => Err(Error::UnsupportedFormat(self.path.clone())),
         }
+    }
+
+    pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
+    pub(crate) fn location(&self) -> &Path {
+        &self.location
+    }
+
+    pub(crate) async fn size(&self) -> Result<u64> {
+        let meta = self.store.head(&self.location).await.map_err(|e| self.error(e))?;
+        Ok(meta.size)
     }
 
     pub(crate) async fn read(&self) -> Result<Bytes> {
