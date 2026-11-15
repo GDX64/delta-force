@@ -17,7 +17,7 @@ use crate::stream::RowStream;
 use crate::delta::{DeltaTable, MergePlan};
 use crate::Changes;
 use crate::engine::ObjectStoreEngine;
-use crate::{Compression, Error, Result, Row, Rows, Value};
+use crate::{Compression, Error, LakeFile, Result, Row, Rows, Value};
 
 /// How a column is stored in the table (Delta's own types).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +31,7 @@ pub enum DataType {
 }
 
 impl DataType {
-    fn to_arrow(self) -> ArrowType {
+    pub(crate) fn to_arrow(self) -> ArrowType {
         match self {
             DataType::Boolean => ArrowType::Boolean,
             DataType::Integer => ArrowType::Int32,
@@ -111,6 +111,7 @@ impl TableConfig {
 #[derive(Clone)]
 pub struct DeltaForce {
     engine: Arc<ObjectStoreEngine>,
+    store: Arc<dyn ObjectStore>,
     root: Url,
 }
 
@@ -131,7 +132,21 @@ impl DeltaForce {
     }
 
     fn with_store(store: Arc<dyn ObjectStore>, root: Url) -> Self {
-        Self { engine: Arc::new(ObjectStoreEngine::new(store)), root }
+        Self { engine: Arc::new(ObjectStoreEngine::new(store.clone())), store, root }
+    }
+
+    /// A file in the lake, by its path relative to the lake root (for
+    /// example `"landing/events.csv"`). Nothing is read until it is used.
+    pub fn file(&self, path: &str) -> LakeFile {
+        let root = object_store::path::Path::from_url_path(self.root.path()).unwrap_or_default();
+        LakeFile::new(self.store.clone(), &root, path)
+    }
+
+    /// Store `contents` as a file in the lake, replacing any existing one.
+    pub async fn put_file(&self, path: &str, contents: impl Into<Vec<u8>>) -> Result<LakeFile> {
+        let file = self.file(path);
+        file.put(contents.into()).await?;
+        Ok(file)
     }
 
     /// Create a new table. Fails with [`Error::TableExists`] if it exists.

@@ -5,9 +5,13 @@ use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
+use delta_kernel::arrow::compute::concat_batches;
 
+use crate::file::{Format, LakeFile};
 use crate::lake::{Column, DataType, arrow_schema, value_at};
 use crate::{Change, Error, Result, Row, Value};
+
+mod csv;
 
 /// Rows to write to a table, stored column by column as they are pushed.
 ///
@@ -15,11 +19,25 @@ use crate::{Change, Error, Result, Row, Value};
 /// table's columns and can check each row as it arrives.
 pub struct RowBatch {
     builders: Builders,
+    /// Rows read from files, already in the table's columns.
+    chunks: Vec<RecordBatch>,
 }
 
 impl RowBatch {
     pub(crate) fn new(columns: Arc<[Column]>) -> Self {
-        Self { builders: Builders::new(columns) }
+        Self { builders: Builders::new(columns), chunks: Vec::new() }
+    }
+
+    /// Add every row of a file in the lake. The format comes from the
+    /// extension (`.csv` for now). Columns are matched by header name,
+    /// ignoring case and order; missing nullable columns are null and empty
+    /// CSV fields are null. On error the batch is unchanged.
+    pub async fn push_file(&mut self, file: &LakeFile) -> Result<()> {
+        let chunks = match file.format()? {
+            Format::Csv => csv::read(file, &self.builders.columns).await?,
+        };
+        self.chunks.extend(chunks);
+        Ok(())
     }
 
     /// Add a row. Columns left out are null. On error the batch is unchanged.
@@ -30,15 +48,18 @@ impl RowBatch {
     }
 
     pub fn len(&self) -> usize {
-        self.builders.len
+        self.builders.len + self.chunks.iter().map(RecordBatch::num_rows).sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.builders.len == 0
+        self.len() == 0
     }
 
     pub(crate) fn finish(self) -> Result<RecordBatch> {
-        self.builders.finish()
+        let schema = Arc::new(arrow_schema(&self.builders.columns));
+        let mut batches = self.chunks;
+        batches.push(self.builders.finish()?);
+        concat_batches(&schema, &batches).map_err(|e| Error::Storage(e.into()))
     }
 }
 

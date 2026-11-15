@@ -21,6 +21,12 @@ pub enum Error {
     /// `write` was called with no rows.
     NoRows,
     InvalidConfig(String),
+    /// A lake file that doesn't exist.
+    FileNotFound(String),
+    /// A lake file whose format can't be read (by extension).
+    UnsupportedFormat(String),
+    /// A lake file whose contents don't fit the table.
+    InvalidFile { file: String, message: String },
     /// An insert used a key that already exists (or the table has duplicates).
     DuplicateKey(String),
     /// An update used a key that doesn't exist.
@@ -43,6 +49,9 @@ impl fmt::Display for Error {
             }
             Error::NoRows => f.write_str("no rows to write"),
             Error::InvalidConfig(m) => write!(f, "invalid config: {m}"),
+            Error::FileNotFound(p) => write!(f, "file {p:?} not found"),
+            Error::UnsupportedFormat(p) => write!(f, "unsupported file format: {p:?}"),
+            Error::InvalidFile { file, message } => write!(f, "{file}: {message}"),
             Error::DuplicateKey(k) => write!(f, "duplicate key {k}"),
             Error::KeyNotFound(k) => write!(f, "key {k} not found"),
             Error::Storage(e) => write!(f, "storage error: {e}"),
