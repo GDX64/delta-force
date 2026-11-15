@@ -22,7 +22,7 @@ async fn append_a_csv_file_from_the_lake() -> anyhow::Result<()> {
     .await?;
 
     let mut batch = events.batch();
-    batch.push_file(&lake.file("landing/events.csv")).await?;
+    batch.push_file(&lake.file("landing/events.csv"));
     events.write(batch).await?;
 
     assert_eq!(

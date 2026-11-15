@@ -21,7 +21,7 @@ async fn append_a_parquet_file_from_the_lake() -> anyhow::Result<()> {
     .await?;
 
     let mut batch = events.batch();
-    batch.push_file(&lake.file("landing/events.parquet")).await?;
+    batch.push_file(&lake.file("landing/events.parquet"));
     events.write(batch).await?;
 
     assert_eq!(

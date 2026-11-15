@@ -7,14 +7,15 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int32Type, Int64Type};
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema};
+use delta_kernel::arrow::compute::concat_batches;
 use futures_util::StreamExt;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
-use crate::batch::{ChangeBatch, RowBatch};
+use crate::batch::{ChangeBatch, RowBatch, split_rows};
 use crate::changes::plan;
 use crate::stream::RowStream;
-use crate::delta::{DeltaTable, MergePlan, Settings};
+use crate::delta::{DeltaTable, MergePlan, Settings, StagedFile};
 use crate::Changes;
 use crate::engine::ObjectStoreEngine;
 use crate::{Compression, Error, LakeFile, Result, Row, Rows, Value};
@@ -251,24 +252,49 @@ impl Table {
     }
 
     /// An empty batch for this table's columns. Fill it with
-    /// [`RowBatch::push`], then hand it to [`Table::write`].
+    /// [`RowBatch::push`] or [`RowBatch::push_file`], then hand it to
+    /// [`Table::write`].
     pub fn batch(&self) -> RowBatch {
-        RowBatch::for_table(self.columns.clone(), self.inner.clone(), self.settings.rows_per_file)
+        RowBatch::new(self.columns.clone())
     }
 
-    /// Append a batch in one commit, together with any data files it
-    /// already wrote out. Returns the new version.
+    /// Append a batch in one commit. Returns the new version.
+    ///
+    /// The batch's rows are pulled as a stream and written out as a data
+    /// file every [`rows_per_file`](TableConfig::rows_per_file) rows, so
+    /// memory holds about one data file. Readers see none of them until the
+    /// commit. On error nothing is committed.
     pub async fn write(&self, batch: RowBatch) -> Result<u64> {
         if batch.is_empty() {
             return Err(Error::NoRows);
         }
-        let (mut staged, rest) = batch.finish_staged()?;
+        let rows_per_file = self.settings.rows_per_file;
+        let mut rows = batch.into_stream();
+        let (mut pending, mut files) = (Vec::new(), Vec::new());
+        while let Some(batch) = rows.next().await {
+            pending.push(batch?);
+            while row_count(&pending) >= rows_per_file {
+                let (file, rest) = split_rows(&pending, rows_per_file);
+                pending = rest;
+                files.push(self.write_file(file).await?);
+            }
+        }
+        if row_count(&pending) > 0 {
+            files.push(self.write_file(pending).await?);
+        }
+        if files.is_empty() {
+            return Err(Error::NoRows);
+        }
+        let inner = self.inner.clone();
+        blocking(move || Ok(inner.commit_files(files)?)).await
+    }
+
+    /// Write `rows` as one data file, uncommitted.
+    async fn write_file(&self, rows: Vec<RecordBatch>) -> Result<StagedFile> {
         let inner = self.inner.clone();
         blocking(move || {
-            if let Some(rest) = rest {
-                staged.push(inner.stage(rest)?);
-            }
-            Ok(inner.commit_files(staged)?)
+            let batch = concat_batches(&rows[0].schema(), &rows).map_err(|e| Error::Storage(e.into()))?;
+            Ok(inner.stage(batch)?)
         })
         .await
     }
@@ -419,6 +445,10 @@ pub(crate) fn batch_rows(batch: &RecordBatch) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
+fn row_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
 pub(crate) fn value_at(array: &dyn Array, i: usize, column: &str) -> Result<Value> {
     if array.is_null(i) {
         return Ok(Value::Null);
@@ -450,15 +480,43 @@ mod tests {
         lake.put_file("b.csv", "id\n4\n5\n6\n").await.unwrap();
 
         let mut batch = table.batch();
-        batch.push_file(&lake.file("a.csv")).await.unwrap(); // file [1, 2]; 3 left
-        batch.push_file(&lake.file("b.csv")).await.unwrap(); // file [4, 5]; then [3, 6]
-        batch.push(crate::row! { "id" => 7 }).unwrap(); // in memory until write
-        assert_eq!(batch.len(), 7);
+        batch.push_file(&lake.file("a.csv")); // [1, 2]; 3 left over
+        batch.push_file(&lake.file("b.csv")); // [3, 4], [5, 6]
+        batch.push(crate::row! { "id" => 7 }).unwrap(); // [7]
         assert_eq!(table.write(batch).await.unwrap(), 1);
 
         let mut files = table.inner.file_rows().unwrap();
         files.sort();
         assert_eq!(files, [1, 2, 2, 2]);
+    }
+
+    #[tokio::test]
+    async fn pushed_files_are_read_only_on_write() {
+        let lake = DeltaForce::in_memory();
+        let table = lake.create(TableConfig::new("t").column("id", DataType::Long)).await.unwrap();
+        let mut batch = table.batch();
+        batch.push_file(&lake.file("later.csv")); // doesn't exist yet
+        lake.put_file("later.csv", "id
+1
+").await.unwrap();
+        assert_eq!(table.write(batch).await.unwrap(), 1);
+
+        let mut batch = table.batch();
+        batch.push_file(&lake.file("missing.csv"));
+        let error = table.write(batch).await.unwrap_err();
+        assert!(matches!(error, Error::FileNotFound(_)), "{error}");
+        assert_eq!(table.version().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn files_without_rows_write_nothing() {
+        let lake = DeltaForce::in_memory();
+        let table = lake.create(TableConfig::new("t").column("id", DataType::Long)).await.unwrap();
+        lake.put_file("empty.csv", "id
+").await.unwrap();
+        let mut batch = table.batch();
+        batch.push_file(&lake.file("empty.csv"));
+        assert!(matches!(table.write(batch).await, Err(Error::NoRows)));
     }
 
     #[test]

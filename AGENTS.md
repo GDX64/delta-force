@@ -29,7 +29,7 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 | File | What it holds |
 |---|---|
 | `src/lake.rs` | Public API: `DeltaForce`, `TableConfig`, `Table`, `DataType` |
-| `src/batch.rs` | `RowBatch` / `ChangeBatch`: rows stored as Arrow builders |
+| `src/batch.rs` | `RowBatch` / `ChangeBatch`: pushed rows as Arrow builders, pushed files read lazily |
 | `src/changes.rs` | `Change`, `Changes` (stream of batches), merge planning by key |
 | `src/stream.rs` | `RowStream`: batch-at-a-time reads on a blocking thread |
 | `src/row.rs` | `Value`, `Row`, `Rows`, the `row!` macro |
@@ -43,9 +43,10 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
   `spawn_blocking`.
 - `apply` is merge-on-read: replaced/deleted rows go into deletion vectors,
   new values are appended. One commit per `ChangeBatch`. Strict mode only.
-- Files are pushed as streams: `push_file` writes a data file every
-  `rows_per_file` rows (default 4M) as it reads, uncommitted; `write` commits
-  them all plus what's left in memory, in one commit. Zstd by default.
+- Lazy: building a batch does no I/O. `push_file` only records the file;
+  `RowBatch::into_stream` reads files as they are pulled. `write` pulls that
+  stream, writes a data file every `rows_per_file` rows (default 4M), and
+  commits them all in one commit. Zstd by default.
 
 ## Conventions
 

@@ -43,8 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let before = process::stats();
     let start = Instant::now();
     let mut batch = events.batch();
-    batch.push_file(&lake.file("landing/events.csv")).await?;
-    let read = start.elapsed();
+    batch.push_file(&lake.file("landing/events.csv"));
     events.write(batch).await?;
     let wall = start.elapsed();
     let after = process::stats();
@@ -53,10 +52,8 @@ async fn main() -> anyhow::Result<()> {
     let (files, bytes) = parquet_files(OUT);
     println!("source       {}  ({rows} rows)", human(size));
     println!(
-        "wall         {:.1} s  (push_file {:.1} s, write {:.1} s; {}/s)",
+        "wall         {:.1} s  ({}/s)",
         wall.as_secs_f64(),
-        read.as_secs_f64(),
-        (wall - read).as_secs_f64(),
         human((size as f64 / wall.as_secs_f64()) as u64),
     );
     println!(

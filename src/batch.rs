@@ -5,11 +5,9 @@ use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
-use delta_kernel::arrow::compute::concat_batches;
-use futures_util::StreamExt;
-use futures_util::stream::BoxStream;
+use futures_util::stream::{self, BoxStream};
+use futures_util::{StreamExt, TryStreamExt};
 
-use crate::delta::{DeltaTable, StagedFile};
 use crate::file::{Format, LakeFile};
 use crate::lake::{Column, DataType, arrow_schema, value_at};
 use crate::{Change, Error, Result, Row, Value};
@@ -18,46 +16,25 @@ mod columns;
 mod csv;
 mod parquet;
 
-/// Batches read from a file, in the table's columns.
-type Batches = BoxStream<'static, Result<RecordBatch>>;
+/// Batches of rows in the table's columns.
+pub(crate) type Batches = BoxStream<'static, Result<RecordBatch>>;
 
-/// Rows to write to a table, stored column by column as they are pushed.
+/// Rows to write to a table: rows pushed one by one, stored column by
+/// column, and files to read them from.
 ///
 /// Get one from [`Table::batch`](crate::Table::batch), so it knows the
-/// table's columns and can check each row as it arrives.
+/// table's columns and can check each row as it arrives. Building a batch
+/// does no I/O: pushed files are read only when the rows are needed, by
+/// [`Table::write`](crate::Table::write).
 pub struct RowBatch {
     builders: Builders,
-    /// Rows read from files, already in the table's columns.
-    chunks: Vec<RecordBatch>,
-    /// Where full data files go while files are pushed; `None` keeps
-    /// everything in memory.
-    sink: Option<Sink>,
-    /// Data files already written, waiting for the commit.
-    staged: Vec<StagedFile>,
-    staged_rows: usize,
-}
-
-/// Writes data files for a table, uncommitted, `rows_per_file` at a time.
-struct Sink {
-    table: DeltaTable,
-    rows_per_file: usize,
+    /// Pushed files, read lazily by [`RowBatch::into_stream`].
+    files: Vec<LakeFile>,
 }
 
 impl RowBatch {
-    /// A batch kept wholly in memory.
     pub(crate) fn new(columns: Arc<[Column]>) -> Self {
-        Self {
-            builders: Builders::new(columns),
-            chunks: Vec::new(),
-            sink: None,
-            staged: Vec::new(),
-            staged_rows: 0,
-        }
-    }
-
-    /// A batch that writes out a data file every `rows_per_file` file rows.
-    pub(crate) fn for_table(columns: Arc<[Column]>, table: DeltaTable, rows_per_file: usize) -> Self {
-        Self { sink: Some(Sink { table, rows_per_file }), ..Self::new(columns) }
+        Self { builders: Builders::new(columns), files: Vec::new() }
     }
 
     /// Add every row of a file in the lake. The format comes from the
@@ -66,38 +43,10 @@ impl RowBatch {
     /// CSV fields are null. Parquet types are converted where they fit
     /// (`int32` into `long`, ...).
     ///
-    /// The file is read as a stream. Every
-    /// [`rows_per_file`](crate::TableConfig::rows_per_file) rows are written
-    /// out as a data file right away, invisible until
-    /// [`Table::write`](crate::Table::write) commits them. On error the
-    /// batch is unchanged (data files already written stay uncommitted).
-    pub async fn push_file(&mut self, file: &LakeFile) -> Result<()> {
-        let columns = self.builders.columns.clone();
-        let mut batches = match file.format()? {
-            Format::Csv => csv::read(file, &columns).await?,
-            Format::Parquet => parquet::read(file, &columns).await?,
-        };
-        // This file's rows, kept apart until the whole file is read.
-        let (mut chunks, mut staged) = (Vec::new(), Vec::new());
-        while let Some(batch) = batches.next().await {
-            chunks.push(batch?);
-            if let Some(sink) = &self.sink {
-                sink.stage_full(&mut chunks, &mut staged).await?;
-            }
-        }
-        self.staged_rows += staged.iter().map(|(_, rows)| rows).sum::<usize>();
-        self.staged.extend(staged.into_iter().map(|(file, _)| file));
-        self.chunks.extend(chunks);
-
-        // Rows left over from several files can fill a data file too.
-        if let Some(sink) = &self.sink {
-            let mut staged = Vec::new();
-            let result = sink.stage_full(&mut self.chunks, &mut staged).await;
-            self.staged_rows += staged.iter().map(|(_, rows)| rows).sum::<usize>();
-            self.staged.extend(staged.into_iter().map(|(file, _)| file));
-            result?;
-        }
-        Ok(())
+    /// Nothing is read now: the file is streamed when the batch is written,
+    /// so a missing or invalid file fails [`Table::write`](crate::Table::write).
+    pub fn push_file(&mut self, file: &LakeFile) {
+        self.files.push(file.clone());
     }
 
     /// Add a row. Columns left out are null. On error the batch is unchanged.
@@ -107,62 +56,33 @@ impl RowBatch {
         Ok(())
     }
 
-    /// Rows in the batch, including those already written out.
-    pub fn len(&self) -> usize {
-        self.staged_rows + self.in_memory()
-    }
-
+    /// Whether nothing was pushed.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.builders.len == 0 && self.files.is_empty()
     }
 
-    fn in_memory(&self) -> usize {
-        self.builders.len + rows(&self.chunks)
-    }
-
-    /// The rows still in memory, as one batch.
+    /// The pushed rows, as one batch. Pushed files are not read.
     pub(crate) fn finish(self) -> Result<RecordBatch> {
-        let schema = Arc::new(arrow_schema(&self.builders.columns));
-        let mut batches = self.chunks;
-        batches.push(self.builders.finish()?);
-        concat_batches(&schema, &batches).map_err(|e| Error::Storage(e.into()))
+        self.builders.finish()
     }
 
-    /// The data files already written, and the rows still in memory, if any.
-    pub(crate) fn finish_staged(mut self) -> Result<(Vec<StagedFile>, Option<RecordBatch>)> {
-        let staged = std::mem::take(&mut self.staged);
-        let rest = if self.in_memory() > 0 { Some(self.finish()?) } else { None };
-        Ok((staged, rest))
-    }
-}
-
-fn rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(RecordBatch::num_rows).sum()
-}
-
-impl Sink {
-    /// While `chunks` hold a full file's rows, write the first
-    /// `rows_per_file` of them as a data file and remove them. Each written
-    /// file goes to `staged` with its row count.
-    async fn stage_full(
-        &self,
-        chunks: &mut Vec<RecordBatch>,
-        staged: &mut Vec<(StagedFile, usize)>,
-    ) -> Result<()> {
-        while rows(chunks) >= self.rows_per_file {
-            let (part, rest) = split_rows(chunks, self.rows_per_file);
-            let table = self.table.clone();
-            let file = tokio::task::spawn_blocking(move || -> Result<StagedFile> {
-                let batch = concat_batches(&part[0].schema(), &part)
-                    .map_err(|e| Error::Storage(e.into()))?;
-                Ok(table.stage(batch)?)
+    /// Every row, in the table's columns: each pushed file in turn, read as
+    /// it is pulled, then the pushed rows.
+    pub(crate) fn into_stream(self) -> Batches {
+        let columns = self.builders.columns.clone();
+        let files = stream::iter(self.files)
+            .then(move |file| {
+                let columns = columns.clone();
+                async move {
+                    match file.format()? {
+                        Format::Csv => csv::read(&file, &columns).await,
+                        Format::Parquet => parquet::read(&file, &columns).await,
+                    }
+                }
             })
-            .await
-            .map_err(|e| Error::Storage(e.into()))??;
-            staged.push((file, self.rows_per_file));
-            *chunks = rest;
-        }
-        Ok(())
+            .try_flatten();
+        let rows = (self.builders.len > 0).then(|| self.builders.finish());
+        files.chain(stream::iter(rows)).boxed()
     }
 }
 
