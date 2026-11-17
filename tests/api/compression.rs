@@ -1,4 +1,4 @@
-use delta_force::{Compression, DataType, DeltaForce, TableConfig, row};
+use delta_force::{Compression, DataType, DeltaForce, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn choose_how_a_table_compresses_its_files() -> anyhow::Result<()> {
@@ -14,7 +14,7 @@ async fn choose_how_a_table_compresses_its_files() -> anyhow::Result<()> {
     let events = lake.table("events").await?;
     assert_eq!(events.compression(), Compression::Snappy);
 
-    let mut batch = events.batch();
+    let mut batch = RowBatch::new(events.schema());
     batch.push(row! { "id" => 1 })?;
     events.write(batch).await?;
 

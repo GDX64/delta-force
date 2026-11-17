@@ -1,4 +1,4 @@
-use delta_force::{DataType, DeltaForce, TableConfig, row};
+use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -14,7 +14,7 @@ async fn create_a_table_write_rows_and_read_them_back() -> anyhow::Result<()> {
         )
         .await?;
 
-    let mut batch = events.batch();
+    let mut batch = RowBatch::new(events.schema());
     batch.push(row! { "id" => 1, "score" => 0.9 })?;
     batch.push(row! { "id" => 2 })?; // a nullable column can be left out
     events.write(batch).await?;

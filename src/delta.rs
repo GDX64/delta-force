@@ -71,9 +71,15 @@ pub(crate) struct Append {
     txn: Transaction,
     context: BoundWriteContext,
     compression: Compression,
+    schema: Schema,
 }
 
 impl Append {
+    /// The table's schema at the snapshot this append writes to.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     /// Write `batch` as a data file of this append, uncommitted.
     pub fn write_file(&mut self, batch: RecordBatch) -> anyhow::Result<()> {
         let add = self.engine.write_data_file(batch, &self.context, self.compression)?;
@@ -178,11 +184,12 @@ impl DeltaTable {
     pub fn append(&self) -> anyhow::Result<Append> {
         let snapshot = self.snapshot()?;
         let compression = compression_of(&snapshot);
+        let schema = snapshot.schema().as_ref().try_into_arrow()?;
         let txn = snapshot
             .update_table(UpdateTableOperation::Write, ENGINE_INFO, true)
             .build(self.engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let context = txn.write_state()?.write_context_builder().build()?;
-        Ok(Append { engine: self.engine.clone(), txn, context, compression })
+        Ok(Append { engine: self.engine.clone(), txn, context, compression, schema })
     }
 
     /// Merge-on-read update in one commit. `f` gets every data file's live

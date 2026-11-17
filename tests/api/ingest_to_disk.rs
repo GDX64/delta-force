@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use delta_force::{DataType, DeltaForce, TableConfig, row};
+use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
 
 /// Kept after the run so the files can be inspected:
 /// `target/api-tests/ingest_1000_rows_to_the_filesystem/events`.
@@ -25,7 +25,7 @@ async fn ingest_1000_rows_to_the_filesystem() -> anyhow::Result<()> {
         )
         .await?;
 
-    let mut batch = events.batch();
+    let mut batch = RowBatch::new(events.schema());
     for id in 0..1_000_i64 {
         batch.push(row! {
             "id" => id,

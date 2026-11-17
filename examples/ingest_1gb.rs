@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use delta_force::test_util::TestStore;
-use delta_force::{DataType, DeltaForce, TableConfig};
+use delta_force::{DataType, DeltaForce, RowBatch, TableConfig};
 
 const OUT: &str = "target/bench/ingest_1gb";
 const HEADER: &[u8] = b"id,name,score,count\n";
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let io_before = store.stats();
     let before = process::stats();
     let start = Instant::now();
-    let mut batch = events.batch();
+    let mut batch = RowBatch::new(events.schema());
     batch.push_file(&lake.file("landing/events.csv"));
     events.write(batch).await?;
     let wall = start.elapsed();

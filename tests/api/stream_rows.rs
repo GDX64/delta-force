@@ -1,4 +1,4 @@
-use delta_force::{DataType, DeltaForce, TableConfig, row};
+use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn read_a_table_as_a_stream_of_row_batches() -> anyhow::Result<()> {
@@ -7,7 +7,7 @@ async fn read_a_table_as_a_stream_of_row_batches() -> anyhow::Result<()> {
         .create(TableConfig::new("events").column("id", DataType::Long))
         .await?;
     for ids in [[1, 2], [3, 4]] {
-        let mut batch = events.batch();
+        let mut batch = RowBatch::new(events.schema());
         for id in ids {
             batch.push(row! { "id" => id })?;
         }

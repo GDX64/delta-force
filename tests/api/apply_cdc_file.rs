@@ -1,4 +1,4 @@
-use delta_force::{Changes, ChangesConfig, DataType, DeltaForce, TableConfig, row};
+use delta_force::{ChangesBatch, ChangesConfig, DataType, DeltaForce, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn apply_a_cdc_file_from_the_lake() -> anyhow::Result<()> {
@@ -10,7 +10,7 @@ async fn apply_a_cdc_file_from_the_lake() -> anyhow::Result<()> {
                 .nullable("score", DataType::Double),
         )
         .await?;
-    let mut batch = events.batch();
+    let mut batch = RowBatch::new(events.schema());
     batch.push(row! { "id" => 1, "score" => 0.9 })?;
     batch.push(row! { "id" => 2, "score" => 0.5 })?;
     events.write(batch).await?;
@@ -27,7 +27,8 @@ async fn apply_a_cdc_file_from_the_lake() -> anyhow::Result<()> {
     .await?;
 
     // The file is read as it is applied, in one commit, never held whole.
-    let mut changes = Changes::new(ChangesConfig::new().key("id").operation("op"));
+    let config = ChangesConfig::new(events.schema()).key("id").operation("op");
+    let mut changes = ChangesBatch::new(config);
     changes.push_file(&lake.file("landing/cdc.csv"));
     events.apply(changes).await?;
 

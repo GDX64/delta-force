@@ -6,16 +6,14 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int32Type, Int64Type};
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType as ArrowType, Field, Schema};
+use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::compute::concat_batches;
 use futures_util::StreamExt;
-use futures_util::stream;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
-use crate::Changes;
-use crate::batch::{ChangeBatch, ChangeStream, RowBatch, change_file, change_file_columns, split_rows};
-use crate::changes::{Planner, Source};
+use crate::batch::{ChangesBatch, RowBatch, split_rows};
+use crate::changes::Planner;
 use crate::delta::{Append, DeltaTable, MergePlan, Settings};
 use crate::engine::ObjectStoreEngine;
 use crate::stream::RowStream;
@@ -67,11 +65,43 @@ impl fmt::Display for DataType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Column {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+}
+
+/// A table's columns: their names, types and whether they can be null.
+/// Get one from [`Table::schema`] to build batches for that table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Schema {
+    columns: Arc<[Column]>,
+}
+
+impl Schema {
+    pub(crate) fn new(columns: Arc<[Column]>) -> Self {
+        Self { columns }
+    }
+
+    pub(crate) fn columns(&self) -> &Arc<[Column]> {
+        &self.columns
+    }
+
+    /// The column names, in order.
+    pub fn column_names(&self) -> impl Iterator<Item = &str> {
+        self.columns.iter().map(|c| c.name.as_str())
+    }
+
+    /// Fails with [`Error::SchemaMismatch`] unless `current` (the table's
+    /// schema now) is this one.
+    fn check(&self, current: &[Column]) -> Result<()> {
+        if *self.columns == *current {
+            Ok(())
+        } else {
+            Err(Error::SchemaMismatch)
+        }
+    }
 }
 
 /// The definition of a new table: its name and columns.
@@ -272,17 +302,16 @@ impl Table {
         self.settings.rows_per_file
     }
 
+    /// The table's columns as of when it was opened or created. Build
+    /// batches with it: [`RowBatch::new`], [`ChangesConfig::new`](crate::ChangesConfig::new).
+    pub fn schema(&self) -> Schema {
+        Schema::new(self.columns.clone())
+    }
+
     /// The latest committed version.
     pub async fn version(&self) -> Result<u64> {
         let (inner, name) = (self.inner.clone(), self.name.clone());
         blocking(move || inner.version()?.ok_or(Error::TableNotFound(name))).await
-    }
-
-    /// An empty batch for this table's columns. Fill it with
-    /// [`RowBatch::push`] or [`RowBatch::push_file`], then hand it to
-    /// [`Table::write`].
-    pub fn batch(&self) -> RowBatch {
-        RowBatch::new(self.columns.clone())
     }
 
     /// Append a batch in one commit. Returns the new version.
@@ -290,14 +319,20 @@ impl Table {
     /// The batch's rows are pulled as a stream and written out as a data
     /// file every [`rows_per_file`](TableConfig::rows_per_file) rows, so
     /// memory holds about one data file. Readers see none of them until the
-    /// commit. On error nothing is committed.
+    /// commit. On error nothing is committed. Fails with
+    /// [`Error::SchemaMismatch`] if the batch's schema isn't the table's.
     pub async fn write(&self, batch: RowBatch) -> Result<u64> {
         if batch.is_empty() {
             return Err(Error::NoRows);
         }
         let rows_per_file = self.settings.rows_per_file;
-        let inner = self.inner.clone();
-        let mut append = blocking(move || Ok(inner.append()?)).await?;
+        let (inner, schema) = (self.inner.clone(), batch.schema());
+        let mut append = blocking(move || {
+            let append = inner.append()?;
+            schema.check(&table_columns(append.schema())?)?;
+            Ok(append)
+        })
+        .await?;
         let mut rows = batch.into_stream();
         let (mut pending, mut files) = (Vec::new(), 0);
         while let Some(batch) = rows.next().await {
@@ -319,98 +354,62 @@ impl Table {
         blocking(move || Ok(append.commit()?)).await
     }
 
-    /// An empty change batch for this table's columns. Fill it with
-    /// [`ChangeBatch::push`], then add it to [`Changes`].
-    pub fn change_batch(&self) -> ChangeBatch {
-        ChangeBatch::new(self.columns.clone())
-    }
-
-    /// Apply `changes` by key, in push order: one commit per change batch
-    /// and per change file. On error, earlier commits stay; a batch or file
-    /// that fails commits nothing.
+    /// Apply `changes` by key, in push order, in one commit. Pushed change
+    /// files are read as they are applied, never held whole. On error
+    /// nothing is committed. Fails with [`Error::SchemaMismatch`] if the
+    /// batch's schema isn't the table's.
     ///
-    /// Change files are read as they are applied, never held whole.
     /// Merge-on-read: replaced and deleted rows are marked in deletion
     /// vectors and new values are appended; existing files aren't rewritten.
-    pub async fn apply(&self, changes: Changes) -> Result<Applied> {
-        let (config, sources) = changes.into_parts();
-        let key = config.key_column()?.to_owned();
-        // Check the config for files before committing anything.
-        let has_files = sources.iter().any(|s| matches!(s, Source::File(_)));
-        let files = match (has_files, config.operation_column()) {
-            (false, _) => None,
-            (true, None) => {
-                return Err(Error::InvalidConfig(
-                    "change files need an operation column (ChangesConfig::operation)".into(),
-                ));
-            }
-            (true, Some(operation)) => {
-                Some((change_file_columns(&self.columns, operation)?, operation.to_owned()))
-            }
-        };
-        let mut applied = Applied::default();
-        for source in sources {
-            let mut changes: ChangeStream = match source {
-                Source::Batch(batch) if batch.is_empty() => continue,
-                Source::Batch(batch) => stream::once(async move { batch.into_changes() }).boxed(),
-                Source::File(file) => {
-                    let (read, operation) = files.clone().expect("checked above");
-                    change_file(file, self.columns.clone(), read, key.clone(), operation)
-                }
-            };
-            let (inner, key) = (self.inner.clone(), key.clone());
-            // Change files are pulled from the blocking thread, as the merge
-            // plan consumes them.
-            let runtime = tokio::runtime::Handle::current();
-            let count = blocking(move || {
-                let columns = table_columns(&inner.arrow_schema()?)?;
-                if !columns.iter().any(|c| c.name == key) {
-                    return Err(Error::ColumnNotFound(key));
-                }
-                let mut count = 0;
-                inner.merge(|files| {
-                    let mut existing = Vec::new();
-                    for (index, file) in files.iter().enumerate() {
-                        let mut positions = file.positions.iter();
-                        for batch in &file.data {
-                            for row in batch_rows(batch)? {
-                                let position = *positions.next().expect("one position per row");
-                                existing.push(((index, position), row));
-                            }
-                        }
-                    }
-                    let mut planner = Planner::new(existing, &key)?;
-                    while let Some(chunk) = runtime.block_on(changes.next()) {
-                        for change in chunk? {
-                            planner.apply(change)?;
-                            count += 1;
-                        }
-                    }
-                    let plan = planner.finish();
-                    let mut merge = MergePlan::default();
-                    for (index, position) in plan.delete {
-                        merge
-                            .deletes
-                            .entry(files[index].path.clone())
-                            .or_default()
-                            .push(position);
-                    }
-                    if !plan.append.is_empty() {
-                        let mut rows = RowBatch::new(columns.into());
-                        for row in plan.append {
-                            rows.push(row)?;
-                        }
-                        merge.append = Some(rows.finish()?);
-                    }
-                    Ok::<_, Error>(merge)
-                })?;
-                Ok(count)
-            })
-            .await?;
-            applied.changes += count;
-            applied.commits += 1;
+    pub async fn apply(&self, changes: ChangesBatch) -> Result<Applied> {
+        if changes.is_empty() {
+            return Ok(Applied::default());
         }
-        Ok(applied)
+        let key = changes.config().key_column()?.to_owned();
+        let schema = changes.config().schema().clone();
+        let mut changes = changes.into_stream()?;
+        let inner = self.inner.clone();
+        // Change files are pulled from the blocking thread, as the merge
+        // plan consumes them.
+        let runtime = tokio::runtime::Handle::current();
+        blocking(move || {
+            schema.check(&table_columns(&inner.arrow_schema()?)?)?;
+            let mut applied = Applied::default();
+            applied.version = inner.merge(|files| {
+                let mut existing = Vec::new();
+                for (index, file) in files.iter().enumerate() {
+                    let mut positions = file.positions.iter();
+                    for batch in &file.data {
+                        for row in batch_rows(batch)? {
+                            let position = *positions.next().expect("one position per row");
+                            existing.push(((index, position), row));
+                        }
+                    }
+                }
+                let mut planner = Planner::new(existing, &key)?;
+                while let Some(chunk) = runtime.block_on(changes.next()) {
+                    for change in chunk? {
+                        planner.apply(change)?;
+                        applied.changes += 1;
+                    }
+                }
+                let plan = planner.finish();
+                let mut merge = MergePlan::default();
+                for (index, position) in plan.delete {
+                    merge.deletes.entry(files[index].path.clone()).or_default().push(position);
+                }
+                if !plan.append.is_empty() {
+                    let mut rows = RowBatch::new(schema.clone());
+                    for row in plan.append {
+                        rows.push(row)?;
+                    }
+                    merge.append = Some(rows.finish()?);
+                }
+                Ok::<_, Error>(merge)
+            })?;
+            Ok(applied)
+        })
+        .await
     }
 
     /// The rows at the latest version, one batch at a time.
@@ -435,8 +434,9 @@ impl Table {
 pub struct Applied {
     /// Changes applied, including rows read from change files.
     pub changes: usize,
-    /// Commits made (one per non-empty batch or file).
-    pub commits: usize,
+    /// The version committed, or `None` if the changes left the table as it
+    /// was (for example, only deletes of missing keys).
+    pub version: Option<u64>,
 }
 
 /// The kernel is synchronous; run it off the async worker threads.
@@ -466,8 +466,8 @@ fn validate_columns(columns: &[Column]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn arrow_schema(columns: &[Column]) -> Schema {
-    Schema::new(
+pub(crate) fn arrow_schema(columns: &[Column]) -> ArrowSchema {
+    ArrowSchema::new(
         columns
             .iter()
             .map(|c| Field::new(&c.name, c.data_type.to_arrow(), c.nullable))
@@ -475,7 +475,7 @@ pub(crate) fn arrow_schema(columns: &[Column]) -> Schema {
     )
 }
 
-fn table_columns(schema: &Schema) -> Result<Vec<Column>> {
+fn table_columns(schema: &ArrowSchema) -> Result<Vec<Column>> {
     schema
         .fields()
         .iter()
@@ -561,7 +561,7 @@ mod tests {
         lake.put_file("a.csv", "id\n1\n2\n3\n").await.unwrap();
         lake.put_file("b.csv", "id\n4\n5\n6\n").await.unwrap();
 
-        let mut batch = table.batch();
+        let mut batch = RowBatch::new(table.schema());
         batch.push_file(&lake.file("a.csv")); // [1, 2]; 3 left over
         batch.push_file(&lake.file("b.csv")); // [3, 4], [5, 6]
         batch.push(crate::row! { "id" => 7 }).unwrap(); // [7]
@@ -579,7 +579,7 @@ mod tests {
             .create(TableConfig::new("t").column("id", DataType::Long))
             .await
             .unwrap();
-        let mut batch = table.batch();
+        let mut batch = RowBatch::new(table.schema());
         batch.push_file(&lake.file("later.csv")); // doesn't exist yet
         lake.put_file(
             "later.csv",
@@ -591,7 +591,7 @@ mod tests {
         .unwrap();
         assert_eq!(table.write(batch).await.unwrap(), 1);
 
-        let mut batch = table.batch();
+        let mut batch = RowBatch::new(table.schema());
         batch.push_file(&lake.file("missing.csv"));
         let error = table.write(batch).await.unwrap_err();
         assert!(matches!(error, Error::FileNotFound(_)), "{error}");
@@ -612,7 +612,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut batch = table.batch();
+        let mut batch = RowBatch::new(table.schema());
         batch.push_file(&lake.file("empty.csv"));
         assert!(matches!(table.write(batch).await, Err(Error::NoRows)));
     }
@@ -648,7 +648,7 @@ mod tests {
         };
 
         let before = log_gets();
-        let mut batch = table.batch();
+        let mut batch = RowBatch::new(table.schema());
         batch.push_file(&lake.file("ids.csv")); // 3 data files
         table.write(batch).await.unwrap();
         assert_eq!(log_gets() - before, 1);
@@ -663,41 +663,38 @@ mod tests {
             .column("name", DataType::String)
             .nullable("score", DataType::Double);
         let table = lake.create(config).await.unwrap();
-        let mut batch = table.batch();
+        let mut batch = RowBatch::new(table.schema());
         batch.push(crate::row! { "id" => 1, "name" => "a", "score" => 0.5 }).unwrap();
         batch.push(crate::row! { "id" => 2, "name" => "b", "score" => 0.5 }).unwrap();
         table.write(batch).await.unwrap();
         table
     }
 
+    fn cdc_config(table: &Table) -> crate::ChangesConfig {
+        crate::ChangesConfig::new(table.schema()).key("id").operation("op")
+    }
+
     async fn apply_file(lake: &DeltaForce, table: &Table, csv: &str) -> Result<Applied> {
         lake.put_file("cdc.csv", csv).await.unwrap();
-        let mut changes = Changes::new(crate::ChangesConfig::new().key("id").operation("op"));
+        let mut changes = ChangesBatch::new(cdc_config(table));
         changes.push_file(&lake.file("cdc.csv"));
         table.apply(changes).await
     }
 
     #[tokio::test]
-    async fn change_files_and_batches_apply_in_push_order() {
+    async fn change_files_and_pushed_changes_apply_in_push_order_in_one_commit() {
         use crate::{Change, row};
         let lake = DeltaForce::in_memory();
         let table = cdc_table(&lake).await;
-        lake.put_file("cdc.csv", "op,id,name
-update,3,c2
-DELETE,1,
-").await.unwrap();
+        lake.put_file("cdc.csv", "op,id,name\nupdate,3,c2\nDELETE,1,\n").await.unwrap();
 
-        let mut changes = Changes::new(crate::ChangesConfig::new().key("id").operation("op"));
-        let mut batch = table.change_batch();
-        batch.push(Change::insert(row! { "id" => 3, "name" => "c" })).unwrap();
-        changes.push(batch);
+        let mut changes = ChangesBatch::new(cdc_config(&table));
+        changes.push(Change::insert(row! { "id" => 3, "name" => "c" })).unwrap();
         changes.push_file(&lake.file("cdc.csv"));
-        let mut batch = table.change_batch();
-        batch.push(Change::insert(row! { "id" => 1, "name" => "a2" })).unwrap();
-        changes.push(batch);
+        changes.push(Change::insert(row! { "id" => 1, "name" => "a2" })).unwrap();
         let applied = table.apply(changes).await.unwrap();
 
-        assert_eq!(applied, Applied { changes: 4, commits: 3 });
+        assert_eq!(applied, Applied { changes: 4, version: Some(2) });
         assert_eq!(
             table.rows().await.unwrap().sorted_by("id"),
             [
@@ -709,19 +706,26 @@ DELETE,1,
     }
 
     #[tokio::test]
+    async fn changes_that_change_nothing_commit_nothing() {
+        let lake = DeltaForce::in_memory();
+        let table = cdc_table(&lake).await;
+        let applied = apply_file(&lake, &table, "op,id\nD,9\n").await.unwrap();
+        assert_eq!(applied, Applied { changes: 1, version: None });
+        let empty = ChangesBatch::new(cdc_config(&table));
+        assert_eq!(table.apply(empty).await.unwrap(), Applied::default());
+        assert_eq!(table.version().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn file_updates_set_only_the_columns_the_file_has() {
         let lake = DeltaForce::in_memory();
         let table = cdc_table(&lake).await;
         // No `score` column: scores are kept. An empty name would be null.
-        apply_file(&lake, &table, "op,id,name
-U,1,z
-").await.unwrap();
+        apply_file(&lake, &table, "op,id,name\nU,1,z\n").await.unwrap();
         let rows = table.rows().await.unwrap().sorted_by("id");
         assert_eq!(rows.to_vec()[0], crate::row! { "id" => 1, "name" => "z", "score" => 0.5 });
 
-        let error = apply_file(&lake, &table, "op,id,name
-U,1,
-").await.unwrap_err();
+        let error = apply_file(&lake, &table, "op,id,name\nU,1,\n").await.unwrap_err();
         assert!(error.to_string().contains("row 1: column \"name\" is not nullable"), "{error}");
     }
 
@@ -733,22 +737,13 @@ U,1,
             let (lake, table) = (lake.clone(), table.clone());
             async move { apply_file(&lake, &table, csv).await.unwrap_err().to_string() }
         };
-        let unknown = error("op,id,name
-i,3,c
-upsert,4,d
-").await;
+        let unknown = error("op,id,name\ni,3,c\nupsert,4,d\n").await;
         assert!(unknown.contains("cdc.csv: row 2: unknown operation \"upsert\""), "{unknown}");
-        let incomplete = error("op,id
-i,3
-").await;
+        let incomplete = error("op,id\ni,3\n").await;
         assert!(incomplete.contains("row 1: column \"name\" is not nullable"), "{incomplete}");
-        let no_key = error("op,id,name
-d,,
-").await;
+        let no_key = error("op,id,name\nd,,\n").await;
         assert!(no_key.contains("row 1: column \"id\""), "{no_key}");
-        let no_op = error("id,name
-3,c
-").await;
+        let no_op = error("id,name\n3,c\n").await;
         assert!(no_op.contains("required column \"op\" is missing"), "{no_op}");
         assert_eq!(table.version().await.unwrap(), 1);
     }
@@ -758,21 +753,58 @@ d,,
         let lake = DeltaForce::in_memory();
         let table = cdc_table(&lake).await;
         let changes = |config: crate::ChangesConfig| {
-            // A batch first: the config is checked before it is committed.
-            let mut batch = table.change_batch();
-            batch.push(crate::Change::delete(crate::row! { "id" => 1 })).unwrap();
-            let mut changes = Changes::new(config.key("id"));
-            changes.push(batch);
+            let mut changes = ChangesBatch::new(config.key("id"));
+            changes.push(crate::Change::delete(crate::row! { "id" => 1 })).unwrap();
             changes.push_file(&lake.file("never-read.csv"));
             changes
         };
-        let config = crate::ChangesConfig::new();
+        let config = crate::ChangesConfig::new(table.schema());
         let error = table.apply(changes(config)).await.unwrap_err();
         assert!(matches!(error, Error::InvalidConfig(_)), "{error}");
 
-        let config = crate::ChangesConfig::new().operation("Name");
+        let config = crate::ChangesConfig::new(table.schema()).operation("Name");
         let error = table.apply(changes(config)).await.unwrap_err();
         assert!(error.to_string().contains("also a table column"), "{error}");
+        assert_eq!(table.version().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pushed_changes_need_the_key() {
+        use crate::{Change, ChangesConfig, row};
+        let lake = DeltaForce::in_memory();
+        let table = cdc_table(&lake).await;
+
+        let mut changes = ChangesBatch::new(ChangesConfig::new(table.schema()));
+        let error = changes.push(Change::delete(row! { "id" => 1 })).unwrap_err();
+        assert!(matches!(error, Error::InvalidConfig(_)), "{error}");
+
+        let mut changes = ChangesBatch::new(ChangesConfig::new(table.schema()).key("nope"));
+        let error = changes.push(Change::delete(row! { "id" => 1 })).unwrap_err();
+        assert!(matches!(error, Error::ColumnNotFound(_)), "{error}");
+
+        let mut changes = ChangesBatch::new(ChangesConfig::new(table.schema()).key("id"));
+        let error = changes.push(Change::update(row! { "name" => "x" })).unwrap_err();
+        assert!(matches!(error, Error::MissingValue(_)), "{error}");
+        assert!(changes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batches_for_another_schema_are_rejected() {
+        use crate::{Change, ChangesConfig, row};
+        let lake = DeltaForce::in_memory();
+        let table = cdc_table(&lake).await;
+        let other = lake
+            .create(TableConfig::new("other").column("id", DataType::Long))
+            .await
+            .unwrap();
+
+        let mut rows = RowBatch::new(other.schema());
+        rows.push(row! { "id" => 3 }).unwrap();
+        assert!(matches!(table.write(rows).await, Err(Error::SchemaMismatch)));
+
+        let mut changes = ChangesBatch::new(ChangesConfig::new(other.schema()).key("id"));
+        changes.push(Change::delete(row! { "id" => 1 })).unwrap();
+        assert!(matches!(table.apply(changes).await, Err(Error::SchemaMismatch)));
         assert_eq!(table.version().await.unwrap(), 1);
     }
 

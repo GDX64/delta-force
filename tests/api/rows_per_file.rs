@@ -1,4 +1,4 @@
-use delta_force::{DataType, DeltaForce, TableConfig, row};
+use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn large_files_are_written_in_parts_but_committed_once() -> anyhow::Result<()> {
@@ -17,7 +17,7 @@ async fn large_files_are_written_in_parts_but_committed_once() -> anyhow::Result
 
     // Pushing a file only records it; write streams it into 3 data files
     // and commits them together.
-    let mut batch = events.batch();
+    let mut batch = RowBatch::new(events.schema());
     batch.push_file(&lake.file("landing/ids.csv"));
     assert_eq!(events.write(batch).await?, 1);
     assert_eq!(

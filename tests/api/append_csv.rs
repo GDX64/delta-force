@@ -1,4 +1,4 @@
-use delta_force::{DataType, DeltaForce, TableConfig, row};
+use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn append_a_csv_file_from_the_lake() -> anyhow::Result<()> {
@@ -21,7 +21,7 @@ async fn append_a_csv_file_from_the_lake() -> anyhow::Result<()> {
     )
     .await?;
 
-    let mut batch = events.batch();
+    let mut batch = RowBatch::new(events.schema());
     batch.push_file(&lake.file("landing/events.csv"));
     events.write(batch).await?;
 

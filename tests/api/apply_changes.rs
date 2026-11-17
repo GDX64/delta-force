@@ -1,4 +1,4 @@
-use delta_force::{Change, Changes, ChangesConfig, DataType, DeltaForce, TableConfig, row};
+use delta_force::{Change, ChangesBatch, ChangesConfig, DataType, DeltaForce, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn apply_inserts_updates_and_deletes() -> anyhow::Result<()> {
@@ -10,19 +10,18 @@ async fn apply_inserts_updates_and_deletes() -> anyhow::Result<()> {
                 .nullable("score", DataType::Double),
         )
         .await?;
-    let mut batch = events.batch();
+    let mut batch = RowBatch::new(events.schema());
     batch.push(row! { "id" => 1, "score" => 0.9 })?;
     batch.push(row! { "id" => 2, "score" => 0.5 })?;
     events.write(batch).await?;
 
-    // One batch is applied in one commit.
-    let mut batch = events.change_batch();
-    batch.push(Change::insert(row! { "id" => 3, "score" => 0.1 }))?;
-    batch.push(Change::update(row! { "id" => 1, "score" => 0.7 }))?;
-    batch.push(Change::delete(row! { "id" => 2 }))?;
-
-    let mut changes = Changes::new(ChangesConfig::new().key("id"));
-    changes.push(batch);
+    // Changes are checked against the table's schema as they are pushed,
+    // and applied by key in one commit.
+    let config = ChangesConfig::new(events.schema()).key("id");
+    let mut changes = ChangesBatch::new(config);
+    changes.push(Change::insert(row! { "id" => 3, "score" => 0.1 }))?;
+    changes.push(Change::update(row! { "id" => 1, "score" => 0.7 }))?;
+    changes.push(Change::delete(row! { "id" => 2 }))?;
     events.apply(changes).await?;
 
     assert_eq!(

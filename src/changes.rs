@@ -1,7 +1,7 @@
-//! Keyed changes applied to a table: [`Change`], [`Changes`], [`ChangesConfig`].
+//! Keyed changes applied to a table: [`Change`], [`ChangesConfig`].
 use std::collections::HashMap;
 
-use crate::{ChangeBatch, Error, LakeFile, Result, Row, Value};
+use crate::{Error, Result, Row, Schema, Value};
 
 /// One change to a row, identified by the key column in [`ChangesConfig`].
 #[derive(Debug, Clone, PartialEq)]
@@ -44,17 +44,20 @@ pub enum ApplyMode {
     Strict,
 }
 
-/// How to interpret [`Changes`].
-#[derive(Debug, Clone, Default)]
+/// What a [`ChangesBatch`](crate::ChangesBatch) holds and how to apply it: the table's schema,
+/// the key column and, for change files, the operation column.
+#[derive(Debug, Clone)]
 pub struct ChangesConfig {
+    schema: Schema,
     key: Option<String>,
     operation: Option<String>,
     mode: ApplyMode,
 }
 
 impl ChangesConfig {
-    pub fn new() -> Self {
-        Self::default()
+    /// Changes to a table with `schema`, from [`Table::schema`](crate::Table::schema).
+    pub fn new(schema: Schema) -> Self {
+        Self { schema, key: None, operation: None, mode: ApplyMode::default() }
     }
 
     /// The column that identifies a row.
@@ -65,7 +68,7 @@ impl ChangesConfig {
 
     /// The column of a change file that says what each row does: `insert`,
     /// `update` or `delete` (or `I`, `U`, `D`). Needed to apply files pushed
-    /// with [`Changes::push_file`]; it is not a table column.
+    /// with [`ChangesBatch::push_file`](crate::ChangesBatch::push_file); it is not a table column.
     pub fn operation(mut self, column: impl Into<String>) -> Self {
         self.operation = Some(column.into());
         self
@@ -76,65 +79,24 @@ impl ChangesConfig {
         self
     }
 
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     pub(crate) fn operation_column(&self) -> Option<&str> {
         self.operation.as_deref()
     }
 
+    /// The key column, which must be one of the schema's.
     pub(crate) fn key_column(&self) -> Result<&str> {
-        self.key
+        let key = self
+            .key
             .as_deref()
-            .ok_or_else(|| Error::InvalidConfig("changes need a key column".into()))
-    }
-}
-
-/// Changes to apply to a table: change batches and change files (CDC
-/// feeds), applied in the order they are pushed, one commit each.
-///
-/// Building it does no I/O: pushed files are read while they are applied.
-pub struct Changes {
-    config: ChangesConfig,
-    sources: Vec<Source>,
-}
-
-/// One unit of [`Changes`], applied in one commit.
-pub(crate) enum Source {
-    Batch(ChangeBatch),
-    File(LakeFile),
-}
-
-impl Changes {
-    pub fn new(config: ChangesConfig) -> Self {
-        Self { config, sources: Vec::new() }
-    }
-
-    /// Add a batch of changes from [`Table::change_batch`](crate::Table::change_batch).
-    pub fn push(&mut self, batch: ChangeBatch) {
-        self.sources.push(Source::Batch(batch));
-    }
-
-    /// Add every change in a file in the lake (a change data capture feed).
-    /// The format comes from the extension: `.csv` or `.parquet`. The column
-    /// named by [`ChangesConfig::operation`] says what each row does:
-    /// `insert`, `update` or `delete`, or `I`, `U`, `D`, ignoring case. The
-    /// other columns are matched by name, ignoring case and order, like
-    /// [`RowBatch::push_file`](crate::RowBatch::push_file).
-    ///
-    /// An insert needs every non-nullable column. An update sets the columns
-    /// the file has (an empty CSV field sets null); the others keep their
-    /// values. A delete only needs the key.
-    ///
-    /// Nothing is read now: the file is streamed while it is applied, so a
-    /// missing or invalid file fails [`Table::apply`](crate::Table::apply).
-    pub fn push_file(&mut self, file: &LakeFile) {
-        self.sources.push(Source::File(file.clone()));
-    }
-
-    pub fn config(&self) -> &ChangesConfig {
-        &self.config
-    }
-
-    pub(crate) fn into_parts(self) -> (ChangesConfig, Vec<Source>) {
-        (self.config, self.sources)
+            .ok_or_else(|| Error::InvalidConfig("changes need a key column".into()))?;
+        if !self.schema.column_names().any(|c| c == key) {
+            return Err(Error::ColumnNotFound(key.to_owned()));
+        }
+        Ok(key)
     }
 }
 
@@ -144,6 +106,11 @@ enum Key {
     Boolean(bool),
     Integer(i64),
     String(String),
+}
+
+/// Fails unless `row` has a usable key in `column`.
+pub(crate) fn check_key(row: &Row, column: &str) -> Result<()> {
+    key_of(row, column).map(|_| ())
 }
 
 fn key_of(row: &Row, column: &str) -> Result<Key> {

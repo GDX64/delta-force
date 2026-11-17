@@ -12,16 +12,15 @@ let events = lake
     .create(TableConfig::new("events").column("id", DataType::Long))
     .await?;                                            // lake.table("events") to reopen
 
-let mut batch = events.batch();                         // columnar, checked on push
+let mut batch = RowBatch::new(events.schema());         // columnar, checked on push
 batch.push(row! { "id" => 1 })?;
 events.write(batch).await?;
 
-let mut batch = events.change_batch();                  // keyed insert/update/delete
-batch.push(Change::delete(row! { "id" => 1 }))?;
-let mut changes = Changes::new(ChangesConfig::new().key("id").operation("op"));
-changes.push(batch);                                    // one commit per batch...
-changes.push_file(&lake.file("landing/cdc.csv"));       // ...and per CDC file (op: I/U/D)
-events.apply(changes).await?;
+let config = ChangesConfig::new(events.schema()).key("id").operation("op");
+let mut changes = ChangesBatch::new(config);            // keyed insert/update/delete
+changes.push(Change::delete(row! { "id" => 1 }))?;
+changes.push_file(&lake.file("landing/cdc.csv"));       // a CDC file, op column I/U/D
+events.apply(changes).await?;                           // one commit, in push order
 
 let mut stream = events.row_stream();                   // one batch in memory at a time
 while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
@@ -31,10 +30,10 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 
 | File | What it holds |
 |---|---|
-| `src/lake.rs` | Public API: `DeltaForce`, `TableConfig`, `Table`, `DataType` |
-| `src/batch.rs` | `RowBatch` / `ChangeBatch`: pushed rows as Arrow builders, pushed files read lazily |
+| `src/lake.rs` | Public API: `DeltaForce`, `TableConfig`, `Table`, `Schema`, `DataType` |
+| `src/batch.rs` | `RowBatch` / `ChangesBatch`: pushed rows as Arrow builders, pushed files read lazily |
 | `src/batch/{csv,parquet,columns}.rs` | File readers: batches of the table columns a file has (`complete` fills the rest) |
-| `src/changes.rs` | `Change`, `Changes` (batches and CDC files), `Planner`: merge planning by key |
+| `src/changes.rs` | `Change`, `ChangesConfig` (schema, key, operation), `Planner`: merge planning by key |
 | `src/stream.rs` | `RowStream`: batch-at-a-time reads on a blocking thread |
 | `src/row.rs` | `Value`, `Row`, `Rows`, the `row!` macro |
 | `src/compression.rs` | Per-table codec, stored as the `delta-force.compression` property |
@@ -46,15 +45,16 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 - `delta_kernel` is synchronous; public async methods run it with
   `spawn_blocking`.
 - `apply` is merge-on-read: replaced/deleted rows go into deletion vectors,
-  new values are appended. One commit per `ChangeBatch` or CDC file pushed
-  into `Changes`. Strict mode only.
+  new values are appended. One commit per `ChangesBatch`. Strict mode only.
 - Lazy: building a batch does no I/O. `push_file` only records the file;
   `RowBatch::into_stream` reads files as they are pulled. `write` pulls that
   stream, writes a data file every `rows_per_file` rows (default 4M), and
   commits them all in one commit. One snapshot (`DeltaTable::append`) serves
   the whole write, so the log is read once. Zstd by default.
-- `Changes` keeps batches and CDC files in push order. For each, `apply`
-  pulls a change stream from inside the merge's blocking thread
+- Batches are built from a table's `Schema` (no table needed); `write` and
+  `apply` fail with `SchemaMismatch` if it isn't the table's current one.
+- `ChangesBatch` keeps pushed changes and CDC files in push order. `apply`
+  pulls its change stream from inside the merge's blocking thread
   (`Handle::block_on`) and folds each change into the `Planner`, so a CDC
   file is never held whole as changes. File columns are read as nullable
   (deletes only carry the key) and each row is checked like `push`.

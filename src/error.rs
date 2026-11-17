@@ -18,6 +18,8 @@ pub enum Error {
         expected: String,
         found: String,
     },
+    /// A batch built from a schema that isn't the table's current one.
+    SchemaMismatch,
     /// `write` was called with no rows.
     NoRows,
     InvalidConfig(String),
@@ -46,6 +48,9 @@ impl fmt::Display for Error {
             Error::MissingValue(c) => write!(f, "column {c:?} is not nullable but has no value"),
             Error::TypeMismatch { column, expected, found } => {
                 write!(f, "column {column:?}: expected {expected}, found {found}")
+            }
+            Error::SchemaMismatch => {
+                f.write_str("the batch was built for a different schema than the table's")
             }
             Error::NoRows => f.write_str("no rows to write"),
             Error::InvalidConfig(m) => write!(f, "invalid config: {m}"),
