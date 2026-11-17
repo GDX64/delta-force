@@ -84,3 +84,11 @@ impl From<std::io::Error> for Error {
         Error::Storage(e.into())
     }
 }
+
+/// So `?` works on store constructors such as
+/// `LocalFileSystem::new_with_prefix` in code returning our [`Result`].
+impl From<object_store::Error> for Error {
+    fn from(e: object_store::Error) -> Self {
+        Error::Storage(e.into())
+    }
+}

@@ -1,6 +1,5 @@
 //! The public API: [`DeltaForce`], [`TableConfig`], [`Table`] and [`DataType`].
 use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -9,7 +8,7 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::compute::concat_batches;
 use futures_util::StreamExt;
-use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
+use object_store::ObjectStore;
 use url::Url;
 
 use crate::batch::{ChangesBatch, RowBatch, split_rows};
@@ -156,50 +155,45 @@ impl TableConfig {
     }
 }
 
-/// A collection of Delta tables under one storage root.
+/// A collection of Delta tables, and the files landing next to them, in
+/// one object store.
 #[derive(Clone)]
 pub struct DeltaForce {
     engine: Arc<ObjectStoreEngine>,
     store: Arc<dyn ObjectStore>,
+    /// The store's root as the kernel sees it. Only its path matters: the
+    /// engine maps every URL's path to an object path in `store`.
     root: Url,
 }
 
 impl DeltaForce {
-    /// Use the local directory `path` as the root, creating it if missing.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = std::path::absolute(path.as_ref())?;
-        let root = Url::from_directory_path(&path)
-            .map_err(|()| Error::Storage(format!("invalid path {}", path.display()).into()))?;
-        blocking(move || Ok(std::fs::create_dir_all(&path)?)).await?;
-        Ok(Self::with_store(Arc::new(LocalFileSystem::new()), root))
-    }
-
-    /// A root that lives only in memory. Handy for tests.
-    pub fn in_memory() -> Self {
-        let root = Url::parse("memory:///").expect("valid url");
-        Self::with_store(Arc::new(InMemory::new()), root)
-    }
-
-    /// A lake whose root is `store`, so it can read virtual files.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn with_test_store(store: crate::test_util::TestStore) -> Self {
-        let root = Url::parse("test:///").expect("valid url");
-        Self::with_store(Arc::new(store), root)
-    }
-
-    fn with_store(store: Arc<dyn ObjectStore>, root: Url) -> Self {
+    /// A lake whose root is the root of `store`: tables live in
+    /// `<table name>/`, and [`DeltaForce::file`] paths are relative to it.
+    /// Any [`object_store`] backend works; nothing is read until used.
+    ///
+    /// ```no_run
+    /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// use delta_force::DeltaForce;
+    /// use delta_force::object_store::{local::LocalFileSystem, memory::InMemory};
+    ///
+    /// let on_disk = DeltaForce::lake(LocalFileSystem::new_with_prefix("data")?);
+    /// let in_memory = DeltaForce::lake(InMemory::new());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn lake(store: impl ObjectStore) -> Self {
+        let store: Arc<dyn ObjectStore> = Arc::new(store);
         Self {
             engine: Arc::new(ObjectStoreEngine::new(store.clone())),
             store,
-            root,
+            root: Url::parse("lake:///").expect("valid url"),
         }
     }
 
     /// A file in the lake, by its path relative to the lake root (for
     /// example `"landing/events.csv"`). Nothing is read until it is used.
     pub fn file(&self, path: &str) -> LakeFile {
-        let root = object_store::path::Path::from_url_path(self.root.path()).unwrap_or_default();
-        LakeFile::new(self.store.clone(), &root, path)
+        LakeFile::new(self.store.clone(), &object_store::path::Path::default(), path)
     }
 
     /// Store `contents` as a file in the lake, replacing any existing one.
@@ -550,10 +544,11 @@ pub(crate) fn value_at(array: &dyn Array, i: usize, column: &str) -> Result<Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
 
     #[tokio::test]
     async fn pushed_files_are_split_into_data_files_of_rows_per_file() {
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let config = TableConfig::new("t")
             .column("id", DataType::Long)
             .rows_per_file(2);
@@ -574,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn pushed_files_are_read_only_on_write() {
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = lake
             .create(TableConfig::new("t").column("id", DataType::Long))
             .await
@@ -600,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn files_without_rows_write_nothing() {
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = lake
             .create(TableConfig::new("t").column("id", DataType::Long))
             .await
@@ -620,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn write_reads_the_log_once_however_many_files() {
         let store = crate::test_util::TestStore::new(InMemory::new());
-        let lake = DeltaForce::with_test_store(store.clone());
+        let lake = DeltaForce::lake(store.clone());
         let config = TableConfig::new("t")
             .column("id", DataType::Long)
             .rows_per_file(2);
@@ -684,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn change_files_and_pushed_changes_apply_in_push_order_in_one_commit() {
         use crate::{Change, row};
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = cdc_table(&lake).await;
         lake.put_file("cdc.csv", "op,id,name\nupdate,3,c2\nDELETE,1,\n").await.unwrap();
 
@@ -707,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn changes_that_change_nothing_commit_nothing() {
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = cdc_table(&lake).await;
         let applied = apply_file(&lake, &table, "op,id\nD,9\n").await.unwrap();
         assert_eq!(applied, Applied { changes: 1, version: None });
@@ -718,7 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_updates_set_only_the_columns_the_file_has() {
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = cdc_table(&lake).await;
         // No `score` column: scores are kept. An empty name would be null.
         apply_file(&lake, &table, "op,id,name\nU,1,z\n").await.unwrap();
@@ -731,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_change_files_fail_without_committing() {
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = cdc_table(&lake).await;
         let error = |csv: &'static str| {
             let (lake, table) = (lake.clone(), table.clone());
@@ -750,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn change_files_need_an_operation_column() {
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = cdc_table(&lake).await;
         let changes = |config: crate::ChangesConfig| {
             let mut changes = ChangesBatch::new(config.key("id"));
@@ -771,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn pushed_changes_need_the_key() {
         use crate::{Change, ChangesConfig, row};
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = cdc_table(&lake).await;
 
         let mut changes = ChangesBatch::new(ChangesConfig::new(table.schema()));
@@ -791,7 +786,7 @@ mod tests {
     #[tokio::test]
     async fn batches_for_another_schema_are_rejected() {
         use crate::{Change, ChangesConfig, row};
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = cdc_table(&lake).await;
         let other = lake
             .create(TableConfig::new("other").column("id", DataType::Long))
@@ -810,7 +805,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn change_files_stream_on_a_multi_threaded_runtime() {
-        let lake = DeltaForce::in_memory();
+        let lake = DeltaForce::lake(InMemory::new());
         let table = cdc_table(&lake).await;
         let applied = apply_file(&lake, &table, "op,id,name
 d,1,

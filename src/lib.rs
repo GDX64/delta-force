@@ -2,9 +2,10 @@
 //!
 //! ```no_run
 //! # async fn demo() -> delta_force::Result<()> {
+//! use delta_force::object_store::local::LocalFileSystem;
 //! use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
 //!
-//! let lake = DeltaForce::open("data").await?;
+//! let lake = DeltaForce::lake(LocalFileSystem::new_with_prefix("data")?);
 //! let events = lake
 //!     .create(TableConfig::new("events").column("id", DataType::Long))
 //!     .await?;
@@ -18,7 +19,11 @@
 //! # }
 //! ```
 //!
-//! Parquet, Arrow and the storage layer stay internal.
+//! Storage is any [`object_store`] backend, re-exported so versions match.
+//! Parquet and Arrow stay internal.
+/// The storage backends a lake can live in: pass one to [`DeltaForce::lake`].
+pub use object_store;
+
 mod batch;
 mod changes;
 mod compression;

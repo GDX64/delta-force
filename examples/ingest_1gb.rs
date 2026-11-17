@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(OUT);
     let store = TestStore::on_disk(OUT)?;
     store.create_virtual_file("landing/events.csv", size, generate);
-    let lake = DeltaForce::with_test_store(store.clone());
+    let lake = DeltaForce::lake(store.clone());
     let events = lake
         .create(
             TableConfig::new("events")

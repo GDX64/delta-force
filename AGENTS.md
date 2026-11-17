@@ -1,13 +1,14 @@
 # delta-force
 
 A friendly, async Rust library for **ingesting** data into Delta Lake tables.
-Users work with dynamic rows; Arrow, Parquet and object_store stay internal
-and must not appear in the public API.
+Users work with dynamic rows; Arrow and Parquet stay internal and must not
+appear in the public API. The one exception is storage: the user picks an
+`object_store` backend (re-exported as `delta_force::object_store`).
 
 ## Using it
 
 ```rust
-let lake = DeltaForce::open("data").await?;            // or DeltaForce::in_memory()
+let lake = DeltaForce::lake(LocalFileSystem::new_with_prefix("data")?); // or InMemory::new(), S3, ...
 let events = lake
     .create(TableConfig::new("events").column("id", DataType::Long))
     .await?;                                            // lake.table("events") to reopen
@@ -39,11 +40,16 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 | `src/compression.rs` | Per-table codec, stored as the `delta-force.compression` property |
 | `src/delta.rs` | Internal Arrow-level table on `delta_kernel` (create, write, merge, scan) |
 | `src/engine.rs`, `src/sync_store.rs` | Our kernel `Engine` over any `ObjectStore` |
+| `src/test_util.rs` | `TestStore`: an `ObjectStore` wrapper with virtual files and I/O counters (`test-util` feature) |
 
 ## How it works
 
+- All I/O goes through the lake's `ObjectStore`; the store's root is the lake
+  root and each table lives in `<name>/`. Table URLs are `lake:///<name>/`:
+  the engine only uses their path, as the object path in the store.
 - `delta_kernel` is synchronous; public async methods run it with
-  `spawn_blocking`.
+  `spawn_blocking`. The engine reaches the async store through
+  `SyncObjectStore`, which blocks on a private runtime.
 - `apply` is merge-on-read: replaced/deleted rows go into deletion vectors,
   new values are appended. One commit per `ChangesBatch`. Strict mode only.
 - Lazy: building a batch does no I/O. `push_file` only records the file;
