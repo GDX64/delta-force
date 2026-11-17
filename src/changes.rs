@@ -50,6 +50,7 @@ pub enum ApplyMode {
 #[derive(Debug, Clone, Default)]
 pub struct ChangesConfig {
     key: Option<String>,
+    operation: Option<String>,
     mode: ApplyMode,
 }
 
@@ -64,9 +65,21 @@ impl ChangesConfig {
         self
     }
 
+    /// The column of a change file that says what each row does: `insert`,
+    /// `update` or `delete` (or `I`, `U`, `D`). Needed to apply files pushed
+    /// with [`ChangeBatch::push_file`]; it is not a table column.
+    pub fn operation(mut self, column: impl Into<String>) -> Self {
+        self.operation = Some(column.into());
+        self
+    }
+
     pub fn mode(mut self, mode: ApplyMode) -> Self {
         self.mode = mode;
         self
+    }
+
+    pub(crate) fn operation_column(&self) -> Option<&str> {
+        self.operation.as_deref()
     }
 
     pub(crate) fn key_column(&self) -> Result<&str> {
@@ -148,63 +161,73 @@ struct Entry {
     changed: bool,
 }
 
-/// Apply `changes` in order, by `key`, to the table's live rows. Only the
+/// Applies changes in order, by key, to the table's live rows. Only the
 /// rows that change end up in the plan; everything else is untouched.
-pub(crate) fn plan(
-    existing: impl IntoIterator<Item = (Location, Row)>,
-    changes: &[Change],
-    key: &str,
-) -> Result<Plan> {
-    let mut entries: HashMap<Key, Entry> = HashMap::new();
-    for (location, row) in existing {
-        let (k, text) = (key_of(&row, key)?, key_text(&row, key));
-        let entry = Entry { origin: Some(location), row: Some(row), changed: false };
-        if entries.insert(k, entry).is_some() {
-            return Err(Error::DuplicateKey(text));
+pub(crate) struct Planner<'a> {
+    key: &'a str,
+    entries: HashMap<Key, Entry>,
+}
+
+impl<'a> Planner<'a> {
+    pub fn new(existing: impl IntoIterator<Item = (Location, Row)>, key: &'a str) -> Result<Self> {
+        let mut entries: HashMap<Key, Entry> = HashMap::new();
+        for (location, row) in existing {
+            let (k, text) = (key_of(&row, key)?, key_text(&row, key));
+            let entry = Entry { origin: Some(location), row: Some(row), changed: false };
+            if entries.insert(k, entry).is_some() {
+                return Err(Error::DuplicateKey(text));
+            }
         }
+        Ok(Self { key, entries })
     }
 
-    for change in changes {
+    pub fn apply(&mut self, change: Change) -> Result<()> {
+        let key = self.key;
         let k = key_of(change.row(), key)?;
         match change {
             Change::Insert(row) => {
-                let entry = entries
+                let entry = self
+                    .entries
                     .entry(k)
                     .or_insert(Entry { origin: None, row: None, changed: false });
                 if entry.row.is_some() {
-                    return Err(Error::DuplicateKey(key_text(row, key)));
+                    return Err(Error::DuplicateKey(key_text(&row, key)));
                 }
-                entry.row = Some(row.clone());
+                entry.row = Some(row);
                 entry.changed = true;
             }
             Change::Update(row) => {
-                let current = entries
+                let current = self
+                    .entries
                     .get_mut(&k)
                     .and_then(|e| e.row.as_mut().map(|r| (r, &mut e.changed)));
                 let (current, changed) =
-                    current.ok_or_else(|| Error::KeyNotFound(key_text(row, key)))?;
+                    current.ok_or_else(|| Error::KeyNotFound(key_text(&row, key)))?;
                 for (column, value) in row.columns() {
                     current.set(column, value.clone());
                 }
                 *changed = true;
             }
             Change::Delete(_) => {
-                if let Some(entry) = entries.get_mut(&k) {
+                if let Some(entry) = self.entries.get_mut(&k) {
                     entry.row = None;
                 }
             }
         }
+        Ok(())
     }
 
-    let mut plan = Plan::default();
-    for entry in entries.into_values() {
-        let replaced = entry.row.is_none() || entry.changed;
-        if let (Some(location), true) = (entry.origin, replaced) {
-            plan.delete.push(location);
+    pub fn finish(self) -> Plan {
+        let mut plan = Plan::default();
+        for entry in self.entries.into_values() {
+            let replaced = entry.row.is_none() || entry.changed;
+            if let (Some(location), true) = (entry.origin, replaced) {
+                plan.delete.push(location);
+            }
+            if let (Some(row), true) = (entry.row, entry.changed) {
+                plan.append.push(row);
+            }
         }
-        if let (Some(row), true) = (entry.row, entry.changed) {
-            plan.append.push(row);
-        }
+        plan
     }
-    Ok(plan)
 }

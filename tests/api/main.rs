@@ -4,6 +4,7 @@
 //! feature. Every feature gets one.
 mod append_csv;
 mod append_parquet;
+mod apply_cdc_file;
 mod apply_changes;
 mod compression;
 mod create_and_write;

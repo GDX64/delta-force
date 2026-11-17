@@ -176,7 +176,9 @@ mod tests {
     #[test]
     fn missing_nullable_column_is_null() {
         let batches = parse_one("id\n1\n2\n").unwrap();
-        assert_eq!(batches[0].column(1).null_count(), 2);
+        assert_eq!(batches[0].num_columns(), 1);
+        let full = super::super::columns::complete(&columns(), &batches[0]).unwrap();
+        assert_eq!(full.column(1).null_count(), 2);
     }
 
     #[test]
