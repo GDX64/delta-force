@@ -65,5 +65,6 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 | Command | What it does |
 |---|---|
 | `./dev benchmark [size]` | Ingests a generated CSV (default `1GB`, e.g. `100MB`) and reports wall time, CPU and peak memory. Source: `examples/ingest_1gb.rs`, which uses `TestStore` virtual files (`test-util` feature). |
+| `./dev profile [size]` | Records a CPU profile of the same benchmark with [samply](https://github.com/mstange/samply) (`cargo install --locked samply`; on Windows it also needs xperf from the Windows Performance Toolkit, and an administrator terminal) and opens it in the Firefox Profiler. Saved to `target/bench/profile.json.gz`; builds with the `profiling` cargo profile (release + debug symbols). |
 
 Add new commands to `dev.py`.

@@ -35,3 +35,8 @@ libc = "0.2"
 [[example]]
 name = "ingest_1gb"
 required-features = ["test-util"]
+
+# `./dev profile`: release speed, with symbols so profiles show function names.
+[profile.profiling]
+inherits = "release"
+debug = true
