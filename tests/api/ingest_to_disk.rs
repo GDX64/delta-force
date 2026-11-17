@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use delta_force::object_store::local::LocalFileSystem;
-use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
+use delta_force::{DataType, Lake, RowBatch, TableConfig, row};
 
 /// Kept after the run so the files can be inspected:
 /// `target/api-tests/ingest_1000_rows_to_the_filesystem/events`.
@@ -18,7 +18,7 @@ fn output_dir(test: &str) -> PathBuf {
 async fn ingest_1000_rows_to_the_filesystem() -> anyhow::Result<()> {
     // The lake lives wherever its store points: here, a local directory.
     let store = LocalFileSystem::new_with_prefix(output_dir("ingest_1000_rows_to_the_filesystem"))?;
-    let lake = DeltaForce::lake(store);
+    let lake = Lake::new(store);
     let events = lake
         .create(
             TableConfig::new("events")

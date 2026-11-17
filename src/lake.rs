@@ -1,4 +1,4 @@
-//! The public API: [`DeltaForce`], [`TableConfig`], [`Table`] and [`DataType`].
+//! The public API: [`Lake`], [`TableConfig`], [`Table`] and [`DataType`].
 use std::fmt;
 use std::sync::Arc;
 
@@ -158,7 +158,7 @@ impl TableConfig {
 /// A collection of Delta tables, and the files landing next to them, in
 /// one object store.
 #[derive(Clone)]
-pub struct DeltaForce {
+pub struct Lake {
     engine: Arc<ObjectStoreEngine>,
     store: Arc<dyn ObjectStore>,
     /// The store's root as the kernel sees it. Only its path matters: the
@@ -166,22 +166,22 @@ pub struct DeltaForce {
     root: Url,
 }
 
-impl DeltaForce {
+impl Lake {
     /// A lake whose root is the root of `store`: tables live in
-    /// `<table name>/`, and [`DeltaForce::file`] paths are relative to it.
+    /// `<table name>/`, and [`Lake::file`] paths are relative to it.
     /// Any [`object_store`] backend works; nothing is read until used.
     ///
     /// ```no_run
     /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    /// use delta_force::DeltaForce;
+    /// use delta_force::Lake;
     /// use delta_force::object_store::{local::LocalFileSystem, memory::InMemory};
     ///
-    /// let on_disk = DeltaForce::lake(LocalFileSystem::new_with_prefix("data")?);
-    /// let in_memory = DeltaForce::lake(InMemory::new());
+    /// let on_disk = Lake::new(LocalFileSystem::new_with_prefix("data")?);
+    /// let in_memory = Lake::new(InMemory::new());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn lake(store: impl ObjectStore) -> Self {
+    pub fn new(store: impl ObjectStore) -> Self {
         let store: Arc<dyn ObjectStore> = Arc::new(store);
         Self {
             engine: Arc::new(ObjectStoreEngine::new(store.clone())),
@@ -548,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn pushed_files_are_split_into_data_files_of_rows_per_file() {
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let config = TableConfig::new("t")
             .column("id", DataType::Long)
             .rows_per_file(2);
@@ -569,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn pushed_files_are_read_only_on_write() {
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = lake
             .create(TableConfig::new("t").column("id", DataType::Long))
             .await
@@ -595,7 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn files_without_rows_write_nothing() {
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = lake
             .create(TableConfig::new("t").column("id", DataType::Long))
             .await
@@ -615,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn write_reads_the_log_once_however_many_files() {
         let store = crate::test_util::TestStore::new(InMemory::new());
-        let lake = DeltaForce::lake(store.clone());
+        let lake = Lake::new(store.clone());
         let config = TableConfig::new("t")
             .column("id", DataType::Long)
             .rows_per_file(2);
@@ -652,7 +652,7 @@ mod tests {
 
     /// A table `t` with `id` (key), required `name` and nullable `score`,
     /// holding ids 1 and 2.
-    async fn cdc_table(lake: &DeltaForce) -> Table {
+    async fn cdc_table(lake: &Lake) -> Table {
         let config = TableConfig::new("t")
             .column("id", DataType::Long)
             .column("name", DataType::String)
@@ -669,7 +669,7 @@ mod tests {
         crate::ChangesConfig::new(table.schema()).key("id").operation("op")
     }
 
-    async fn apply_file(lake: &DeltaForce, table: &Table, csv: &str) -> Result<Applied> {
+    async fn apply_file(lake: &Lake, table: &Table, csv: &str) -> Result<Applied> {
         lake.put_file("cdc.csv", csv).await.unwrap();
         let mut changes = ChangesBatch::new(cdc_config(table));
         changes.push_file(&lake.file("cdc.csv"));
@@ -679,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn change_files_and_pushed_changes_apply_in_push_order_in_one_commit() {
         use crate::{Change, row};
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         lake.put_file("cdc.csv", "op,id,name\nupdate,3,c2\nDELETE,1,\n").await.unwrap();
 
@@ -702,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn changes_that_change_nothing_commit_nothing() {
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         let applied = apply_file(&lake, &table, "op,id\nD,9\n").await.unwrap();
         assert_eq!(applied, Applied { changes: 1, version: None });
@@ -713,7 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_updates_set_only_the_columns_the_file_has() {
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         // No `score` column: scores are kept. An empty name would be null.
         apply_file(&lake, &table, "op,id,name\nU,1,z\n").await.unwrap();
@@ -726,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_change_files_fail_without_committing() {
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         let error = |csv: &'static str| {
             let (lake, table) = (lake.clone(), table.clone());
@@ -745,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn change_files_need_an_operation_column() {
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         let changes = |config: crate::ChangesConfig| {
             let mut changes = ChangesBatch::new(config.key("id"));
@@ -766,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn pushed_changes_need_the_key() {
         use crate::{Change, ChangesConfig, row};
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
 
         let mut changes = ChangesBatch::new(ChangesConfig::new(table.schema()));
@@ -786,7 +786,7 @@ mod tests {
     #[tokio::test]
     async fn batches_for_another_schema_are_rejected() {
         use crate::{Change, ChangesConfig, row};
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         let other = lake
             .create(TableConfig::new("other").column("id", DataType::Long))
@@ -805,7 +805,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn change_files_stream_on_a_multi_threaded_runtime() {
-        let lake = DeltaForce::lake(InMemory::new());
+        let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         let applied = apply_file(&lake, &table, "op,id,name
 d,1,

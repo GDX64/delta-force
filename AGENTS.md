@@ -8,7 +8,7 @@ appear in the public API. The one exception is storage: the user picks an
 ## Using it
 
 ```rust
-let lake = DeltaForce::lake(LocalFileSystem::new_with_prefix("data")?); // or InMemory::new(), S3, ...
+let lake = Lake::new(LocalFileSystem::new_with_prefix("data")?); // or InMemory::new(), S3, ...
 let events = lake
     .create(TableConfig::new("events").column("id", DataType::Long))
     .await?;                                            // lake.table("events") to reopen
@@ -31,7 +31,7 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 
 | File | What it holds |
 |---|---|
-| `src/lake.rs` | Public API: `DeltaForce`, `TableConfig`, `Table`, `Schema`, `DataType` |
+| `src/lake.rs` | Public API: `Lake`, `TableConfig`, `Table`, `Schema`, `DataType` |
 | `src/batch.rs` | `RowBatch` / `ChangesBatch`: pushed rows as Arrow builders, pushed files read lazily |
 | `src/batch/{csv,parquet,columns}.rs` | File readers: batches of the table columns a file has (`complete` fills the rest) |
 | `src/changes.rs` | `Change`, `ChangesConfig` (schema, key, operation), `Planner`: merge planning by key |

@@ -1,9 +1,9 @@
 use delta_force::object_store::memory::InMemory;
-use delta_force::{Compression, DataType, DeltaForce, RowBatch, TableConfig, row};
+use delta_force::{Compression, DataType, Lake, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn choose_how_a_table_compresses_its_files() -> anyhow::Result<()> {
-    let lake = DeltaForce::lake(InMemory::new());
+    let lake = Lake::new(InMemory::new());
     lake.create(
         TableConfig::new("events")
             .column("id", DataType::Long)

@@ -1,9 +1,9 @@
 use delta_force::object_store::memory::InMemory;
-use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
+use delta_force::{DataType, Lake, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn large_files_are_written_in_parts_but_committed_once() -> anyhow::Result<()> {
-    let lake = DeltaForce::lake(InMemory::new());
+    let lake = Lake::new(InMemory::new());
     let events = lake
         .create(
             TableConfig::new("events")

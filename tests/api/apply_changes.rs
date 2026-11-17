@@ -1,9 +1,9 @@
 use delta_force::object_store::memory::InMemory;
-use delta_force::{Change, ChangesBatch, ChangesConfig, DataType, DeltaForce, RowBatch, TableConfig, row};
+use delta_force::{Change, ChangesBatch, ChangesConfig, DataType, Lake, RowBatch, TableConfig, row};
 
 #[tokio::test]
 async fn apply_inserts_updates_and_deletes() -> anyhow::Result<()> {
-    let lake = DeltaForce::lake(InMemory::new());
+    let lake = Lake::new(InMemory::new());
     let events = lake
         .create(
             TableConfig::new("events")

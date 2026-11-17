@@ -1,11 +1,11 @@
 use delta_force::object_store::local::LocalFileSystem;
-use delta_force::{DataType, DeltaForce, RowBatch, TableConfig, row};
+use delta_force::{DataType, Lake, RowBatch, TableConfig, row};
 use tempfile::TempDir;
 
 #[tokio::test]
 async fn create_a_table_write_rows_and_read_them_back() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
-    let lake = DeltaForce::lake(LocalFileSystem::new_with_prefix(dir.path())?);
+    let lake = Lake::new(LocalFileSystem::new_with_prefix(dir.path())?);
 
     let events = lake
         .create(

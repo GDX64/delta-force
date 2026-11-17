@@ -10,7 +10,7 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use crate::{Error, Result};
 
 /// A file in the lake, addressed by its path relative to the lake root.
-/// Get one with [`DeltaForce::file`](crate::DeltaForce::file).
+/// Get one with [`Lake::file`](crate::Lake::file).
 #[derive(Clone)]
 pub struct LakeFile {
     store: Arc<dyn ObjectStore>,

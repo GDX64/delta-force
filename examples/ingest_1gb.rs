@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use delta_force::test_util::TestStore;
-use delta_force::{DataType, DeltaForce, RowBatch, TableConfig};
+use delta_force::{DataType, Lake, RowBatch, TableConfig};
 
 const OUT: &str = "target/bench/ingest_1gb";
 const HEADER: &[u8] = b"id,name,score,count\n";
@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(OUT);
     let store = TestStore::on_disk(OUT)?;
     store.create_virtual_file("landing/events.csv", size, generate);
-    let lake = DeltaForce::lake(store.clone());
+    let lake = Lake::new(store.clone());
     let events = lake
         .create(
             TableConfig::new("events")
