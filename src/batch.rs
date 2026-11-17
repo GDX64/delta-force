@@ -112,26 +112,11 @@ pub(crate) fn split_rows(batches: &[RecordBatch], n: usize) -> (Vec<RecordBatch>
     (head, tail)
 }
 
-/// Changes to apply to a table: changes pushed one by one, stored column
-/// by column, and change files to read them from, in push order.
+/// Changes to apply to a table, stored column by column as they are pushed.
 ///
-/// Get one from [`Table::change_batch`](crate::Table::change_batch). Each
-/// batch is applied in one commit. Building a batch does no I/O: pushed
-/// files are read while the batch is applied.
+/// Get one from [`Table::change_batch`](crate::Table::change_batch) and add
+/// it to [`Changes`](crate::Changes). Each batch is applied in one commit.
 pub struct ChangeBatch {
-    columns: Arc<[Column]>,
-    parts: Vec<Part>,
-    /// Changes pushed with [`ChangeBatch::push`].
-    len: usize,
-}
-
-enum Part {
-    Pushed(Pushed),
-    File(LakeFile),
-}
-
-/// A run of changes pushed one by one.
-struct Pushed {
     builders: Builders,
     kinds: Vec<Kind>,
     /// Row-major: whether change `i` set column `c` (`i * columns + c`).
@@ -172,127 +157,39 @@ impl Kind {
     }
 }
 
-/// How [`ChangeBatch::into_stream`] reads change files.
-pub(crate) struct ChangeFiles<'a> {
-    pub key: &'a str,
-    /// The column naming each row's operation, if configured.
-    pub operation: Option<&'a str>,
-}
+/// Changes, a chunk at a time.
+pub(crate) type ChangeStream = BoxStream<'static, Result<Vec<Change>>>;
 
 impl ChangeBatch {
     pub(crate) fn new(columns: Arc<[Column]>) -> Self {
-        Self { columns, parts: Vec::new(), len: 0 }
+        Self { builders: Builders::new(columns), kinds: Vec::new(), present: Vec::new() }
     }
 
     /// Add a change. An insert needs every non-nullable column; an update or
     /// delete only the columns it sets. On error the batch is unchanged.
     pub fn push(&mut self, change: Change) -> Result<()> {
-        if !matches!(self.parts.last(), Some(Part::Pushed(_))) {
-            self.parts.push(Part::Pushed(Pushed {
-                builders: Builders::new(self.columns.clone()),
-                kinds: Vec::new(),
-                present: Vec::new(),
-            }));
-        }
-        let Some(Part::Pushed(pushed)) = self.parts.last_mut() else { unreachable!() };
         let (kind, row) = match change {
             Change::Insert(row) => (Kind::Insert, row),
             Change::Update(row) => (Kind::Update, row),
             Change::Delete(row) => (Kind::Delete, row),
         };
-        if let Err(e) = pushed.builders.check(row, kind == Kind::Insert) {
-            if pushed.kinds.is_empty() {
-                self.parts.pop();
-            }
-            return Err(e);
-        }
-        pushed.present.extend_from_slice(&pushed.builders.present);
-        pushed.kinds.push(kind);
-        pushed.builders.append_checked();
-        self.len += 1;
+        self.builders.check(row, kind == Kind::Insert)?;
+        self.present.extend_from_slice(&self.builders.present);
+        self.kinds.push(kind);
+        self.builders.append_checked();
         Ok(())
     }
 
-    /// Add every change in a file in the lake (a change data capture feed).
-    /// The format comes from the extension: `.csv` or `.parquet`. The column
-    /// named by [`ChangesConfig::operation`](crate::ChangesConfig::operation)
-    /// says what each row does: `insert`, `update` or `delete`, or `I`, `U`,
-    /// `D`, ignoring case. The other columns are matched by name, ignoring
-    /// case and order, like [`RowBatch::push_file`].
-    ///
-    /// An insert needs every non-nullable column. An update sets the columns
-    /// the file has (an empty CSV field sets null); the others keep their
-    /// values. A delete only needs the key.
-    ///
-    /// Nothing is read now: the file is streamed while the batch is applied,
-    /// so a missing or invalid file fails [`Table::apply`](crate::Table::apply).
-    pub fn push_file(&mut self, file: &LakeFile) {
-        self.parts.push(Part::File(file.clone()));
-    }
-
-    /// Changes added with [`ChangeBatch::push`]. Rows in pushed files are
-    /// not counted: they aren't read until the batch is applied.
     pub fn len(&self) -> usize {
-        self.len
+        self.kinds.len()
     }
 
-    /// Whether nothing was pushed.
     pub fn is_empty(&self) -> bool {
-        self.parts.is_empty()
+        self.kinds.is_empty()
     }
 
-    /// The changes in push order, a chunk at a time: each pushed file is read
-    /// as it is pulled. Fails now if there are files but no operation column.
-    pub(crate) fn into_stream(
-        self,
-        config: ChangeFiles<'_>,
-    ) -> Result<BoxStream<'static, Result<Vec<Change>>>> {
-        let has_files = self.parts.iter().any(|p| matches!(p, Part::File(_)));
-        let file_columns = match (has_files, config.operation) {
-            (false, _) => None,
-            (true, None) => {
-                return Err(Error::InvalidConfig(
-                    "change files need an operation column (ChangesConfig::operation)".into(),
-                ));
-            }
-            (true, Some(operation)) => Some(file_columns(&self.columns, operation)?),
-        };
-        let (columns, key) = (self.columns, config.key.to_owned());
-        let parts = self.parts.into_iter().map(move |part| match part {
-            Part::Pushed(pushed) => stream::once(async move { pushed.into_changes() }).boxed(),
-            Part::File(file) => {
-                let (columns, key) = (columns.clone(), key.clone());
-                let read = file_columns.clone().expect("checked above");
-                stream::once(async move {
-                    let batches = read_file(&file, &read.0).await?;
-                    let mut reader = FileChanges::new(file, columns, key, read.1);
-                    Ok::<_, Error>(batches.map(move |batch| reader.changes(&batch?)))
-                })
-                .try_flatten()
-                .boxed()
-            }
-        });
-        Ok(stream::iter(parts).flatten().boxed())
-    }
-}
-
-/// The columns to read a change file with: every table column, nullable
-/// (a delete only carries the key), then the operation column. Also returns
-/// the operation column's name.
-fn file_columns(columns: &[Column], operation: &str) -> Result<(Arc<[Column]>, String)> {
-    if columns.iter().any(|c| c.name.eq_ignore_ascii_case(operation)) {
-        return Err(Error::InvalidConfig(format!(
-            "operation column {operation:?} is also a table column"
-        )));
-    }
-    let mut read: Vec<Column> = columns.iter().map(|c| Column { nullable: true, ..c.clone() }).collect();
-    read.push(Column { name: operation.to_owned(), data_type: DataType::String, nullable: false });
-    Ok((read.into(), operation.to_owned()))
-}
-
-impl Pushed {
     /// The changes in push order, for planning a merge.
-    fn into_changes(self) -> Result<Vec<Change>> {
+    pub(crate) fn into_changes(self) -> Result<Vec<Change>> {
         let columns = self.builders.columns.clone();
         let data = self.builders.finish()?;
         let mut changes = Vec::with_capacity(self.kinds.len());
@@ -307,6 +204,37 @@ impl Pushed {
         }
         Ok(changes)
     }
+}
+
+/// The columns to read a change file with: every table column, nullable
+/// (a delete only carries the key), then the operation column.
+pub(crate) fn change_file_columns(columns: &[Column], operation: &str) -> Result<Arc<[Column]>> {
+    if columns.iter().any(|c| c.name.eq_ignore_ascii_case(operation)) {
+        return Err(Error::InvalidConfig(format!(
+            "operation column {operation:?} is also a table column"
+        )));
+    }
+    let mut read: Vec<Column> = columns.iter().map(|c| Column { nullable: true, ..c.clone() }).collect();
+    read.push(Column { name: operation.to_owned(), data_type: DataType::String, nullable: false });
+    Ok(read.into())
+}
+
+/// The changes in a change file, read as they are pulled. `read` comes from
+/// [`change_file_columns`] for the table `columns`.
+pub(crate) fn change_file(
+    file: LakeFile,
+    columns: Arc<[Column]>,
+    read: Arc<[Column]>,
+    key: String,
+    operation: String,
+) -> ChangeStream {
+    stream::once(async move {
+        let batches = read_file(&file, &read).await?;
+        let mut reader = FileChanges::new(file, columns, key, operation);
+        Ok::<_, Error>(batches.map(move |batch| reader.changes(&batch?)))
+    })
+    .try_flatten()
+    .boxed()
 }
 
 /// Turns batches read from a change file into checked changes.

@@ -1,9 +1,7 @@
 //! Keyed changes applied to a table: [`Change`], [`Changes`], [`ChangesConfig`].
 use std::collections::HashMap;
 
-use futures_util::stream::{self, BoxStream, StreamExt};
-
-use crate::{ChangeBatch, Error, Result, Row, Value};
+use crate::{ChangeBatch, Error, LakeFile, Result, Row, Value};
 
 /// One change to a row, identified by the key column in [`ChangesConfig`].
 #[derive(Debug, Clone, PartialEq)]
@@ -46,7 +44,7 @@ pub enum ApplyMode {
     Strict,
 }
 
-/// How to interpret a stream of [`ChangeBatch`]es.
+/// How to interpret [`Changes`].
 #[derive(Debug, Clone, Default)]
 pub struct ChangesConfig {
     key: Option<String>,
@@ -67,7 +65,7 @@ impl ChangesConfig {
 
     /// The column of a change file that says what each row does: `insert`,
     /// `update` or `delete` (or `I`, `U`, `D`). Needed to apply files pushed
-    /// with [`ChangeBatch::push_file`]; it is not a table column.
+    /// with [`Changes::push_file`]; it is not a table column.
     pub fn operation(mut self, column: impl Into<String>) -> Self {
         self.operation = Some(column.into());
         self
@@ -89,32 +87,54 @@ impl ChangesConfig {
     }
 }
 
-/// A stream of change batches plus the config that says how to apply them.
+/// Changes to apply to a table: change batches and change files (CDC
+/// feeds), applied in the order they are pushed, one commit each.
+///
+/// Building it does no I/O: pushed files are read while they are applied.
 pub struct Changes {
     config: ChangesConfig,
-    stream: BoxStream<'static, Result<ChangeBatch>>,
+    sources: Vec<Source>,
+}
+
+/// One unit of [`Changes`], applied in one commit.
+pub(crate) enum Source {
+    Batch(ChangeBatch),
+    File(LakeFile),
 }
 
 impl Changes {
-    /// Change batches held in memory.
-    pub fn in_memory(
-        config: ChangesConfig,
-        batches: impl IntoIterator<Item = ChangeBatch>,
-    ) -> Self {
-        let batches: Vec<ChangeBatch> = batches.into_iter().collect();
-        Self {
-            config,
-            stream: stream::iter(batches.into_iter().map(Ok)).boxed(),
-        }
+    pub fn new(config: ChangesConfig) -> Self {
+        Self { config, sources: Vec::new() }
+    }
+
+    /// Add a batch of changes from [`Table::change_batch`](crate::Table::change_batch).
+    pub fn push(&mut self, batch: ChangeBatch) {
+        self.sources.push(Source::Batch(batch));
+    }
+
+    /// Add every change in a file in the lake (a change data capture feed).
+    /// The format comes from the extension: `.csv` or `.parquet`. The column
+    /// named by [`ChangesConfig::operation`] says what each row does:
+    /// `insert`, `update` or `delete`, or `I`, `U`, `D`, ignoring case. The
+    /// other columns are matched by name, ignoring case and order, like
+    /// [`RowBatch::push_file`](crate::RowBatch::push_file).
+    ///
+    /// An insert needs every non-nullable column. An update sets the columns
+    /// the file has (an empty CSV field sets null); the others keep their
+    /// values. A delete only needs the key.
+    ///
+    /// Nothing is read now: the file is streamed while it is applied, so a
+    /// missing or invalid file fails [`Table::apply`](crate::Table::apply).
+    pub fn push_file(&mut self, file: &LakeFile) {
+        self.sources.push(Source::File(file.clone()));
     }
 
     pub fn config(&self) -> &ChangesConfig {
         &self.config
     }
 
-    /// The change batches as an async stream.
-    pub fn into_stream(self) -> BoxStream<'static, Result<ChangeBatch>> {
-        self.stream
+    pub(crate) fn into_parts(self) -> (ChangesConfig, Vec<Source>) {
+        (self.config, self.sources)
     }
 }
 

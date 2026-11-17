@@ -1,7 +1,7 @@
 use delta_force::{Change, Changes, ChangesConfig, DataType, DeltaForce, TableConfig, row};
 
 #[tokio::test]
-async fn apply_a_stream_of_inserts_updates_and_deletes() -> anyhow::Result<()> {
+async fn apply_inserts_updates_and_deletes() -> anyhow::Result<()> {
     let lake = DeltaForce::in_memory();
     let events = lake
         .create(
@@ -15,13 +15,15 @@ async fn apply_a_stream_of_inserts_updates_and_deletes() -> anyhow::Result<()> {
     batch.push(row! { "id" => 2, "score" => 0.5 })?;
     events.write(batch).await?;
 
-    let mut changes = events.change_batch();
-    changes.push(Change::insert(row! { "id" => 3, "score" => 0.1 }))?;
-    changes.push(Change::update(row! { "id" => 1, "score" => 0.7 }))?;
-    changes.push(Change::delete(row! { "id" => 2 }))?;
+    // One batch is applied in one commit.
+    let mut batch = events.change_batch();
+    batch.push(Change::insert(row! { "id" => 3, "score" => 0.1 }))?;
+    batch.push(Change::update(row! { "id" => 1, "score" => 0.7 }))?;
+    batch.push(Change::delete(row! { "id" => 2 }))?;
 
-    let stream = Changes::in_memory(ChangesConfig::new().key("id"), [changes]);
-    events.apply(stream).await?;
+    let mut changes = Changes::new(ChangesConfig::new().key("id"));
+    changes.push(batch);
+    events.apply(changes).await?;
 
     assert_eq!(
         events.rows().await?.sorted_by("id"),

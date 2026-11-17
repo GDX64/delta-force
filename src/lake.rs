@@ -9,12 +9,13 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema};
 use delta_kernel::arrow::compute::concat_batches;
 use futures_util::StreamExt;
+use futures_util::stream;
 use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
 use crate::Changes;
-use crate::batch::{ChangeBatch, ChangeFiles, RowBatch, split_rows};
-use crate::changes::Planner;
+use crate::batch::{ChangeBatch, ChangeStream, RowBatch, change_file, change_file_columns, split_rows};
+use crate::changes::{Planner, Source};
 use crate::delta::{Append, DeltaTable, MergePlan, Settings};
 use crate::engine::ObjectStoreEngine;
 use crate::stream::RowStream;
@@ -319,30 +320,44 @@ impl Table {
     }
 
     /// An empty change batch for this table's columns. Fill it with
-    /// [`ChangeBatch::push`] or [`ChangeBatch::push_file`], then send it
-    /// through [`Changes`].
+    /// [`ChangeBatch::push`], then add it to [`Changes`].
     pub fn change_batch(&self) -> ChangeBatch {
         ChangeBatch::new(self.columns.clone())
     }
 
-    /// Read `changes` as a stream and apply them by key, one commit per
-    /// batch. Resolves when the stream ends. On error, earlier batches stay
-    /// committed.
+    /// Apply `changes` by key, in push order: one commit per change batch
+    /// and per change file. On error, earlier commits stay; a batch or file
+    /// that fails commits nothing.
     ///
+    /// Change files are read as they are applied, never held whole.
     /// Merge-on-read: replaced and deleted rows are marked in deletion
     /// vectors and new values are appended; existing files aren't rewritten.
     pub async fn apply(&self, changes: Changes) -> Result<Applied> {
-        let key = changes.config().key_column()?.to_owned();
-        let operation = changes.config().operation_column().map(str::to_owned);
-        let mut stream = changes.into_stream();
-        let mut applied = Applied::default();
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            if batch.is_empty() {
-                continue;
+        let (config, sources) = changes.into_parts();
+        let key = config.key_column()?.to_owned();
+        // Check the config for files before committing anything.
+        let has_files = sources.iter().any(|s| matches!(s, Source::File(_)));
+        let files = match (has_files, config.operation_column()) {
+            (false, _) => None,
+            (true, None) => {
+                return Err(Error::InvalidConfig(
+                    "change files need an operation column (ChangesConfig::operation)".into(),
+                ));
             }
-            let config = ChangeFiles { key: &key, operation: operation.as_deref() };
-            let mut changes = batch.into_stream(config)?;
+            (true, Some(operation)) => {
+                Some((change_file_columns(&self.columns, operation)?, operation.to_owned()))
+            }
+        };
+        let mut applied = Applied::default();
+        for source in sources {
+            let mut changes: ChangeStream = match source {
+                Source::Batch(batch) if batch.is_empty() => continue,
+                Source::Batch(batch) => stream::once(async move { batch.into_changes() }).boxed(),
+                Source::File(file) => {
+                    let (read, operation) = files.clone().expect("checked above");
+                    change_file(file, self.columns.clone(), read, key.clone(), operation)
+                }
+            };
             let (inner, key) = (self.inner.clone(), key.clone());
             // Change files are pulled from the blocking thread, as the merge
             // plan consumes them.
@@ -418,9 +433,9 @@ impl Table {
 /// What [`Table::apply`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// Changes applied.
+    /// Changes applied, including rows read from change files.
     pub changes: usize,
-    /// Commits made (one per non-empty batch).
+    /// Commits made (one per non-empty batch or file).
     pub commits: usize,
 }
 
@@ -657,14 +672,13 @@ mod tests {
 
     async fn apply_file(lake: &DeltaForce, table: &Table, csv: &str) -> Result<Applied> {
         lake.put_file("cdc.csv", csv).await.unwrap();
-        let mut changes = table.change_batch();
+        let mut changes = Changes::new(crate::ChangesConfig::new().key("id").operation("op"));
         changes.push_file(&lake.file("cdc.csv"));
-        let config = crate::ChangesConfig::new().key("id").operation("op");
-        table.apply(Changes::in_memory(config, [changes])).await
+        table.apply(changes).await
     }
 
     #[tokio::test]
-    async fn change_files_and_pushed_changes_apply_in_push_order() {
+    async fn change_files_and_batches_apply_in_push_order() {
         use crate::{Change, row};
         let lake = DeltaForce::in_memory();
         let table = cdc_table(&lake).await;
@@ -673,14 +687,17 @@ update,3,c2
 DELETE,1,
 ").await.unwrap();
 
-        let mut changes = table.change_batch();
-        changes.push(Change::insert(row! { "id" => 3, "name" => "c" })).unwrap();
+        let mut changes = Changes::new(crate::ChangesConfig::new().key("id").operation("op"));
+        let mut batch = table.change_batch();
+        batch.push(Change::insert(row! { "id" => 3, "name" => "c" })).unwrap();
+        changes.push(batch);
         changes.push_file(&lake.file("cdc.csv"));
-        changes.push(Change::insert(row! { "id" => 1, "name" => "a2" })).unwrap();
-        let config = crate::ChangesConfig::new().key("id").operation("op");
-        let applied = table.apply(Changes::in_memory(config, [changes])).await.unwrap();
+        let mut batch = table.change_batch();
+        batch.push(Change::insert(row! { "id" => 1, "name" => "a2" })).unwrap();
+        changes.push(batch);
+        let applied = table.apply(changes).await.unwrap();
 
-        assert_eq!(applied, Applied { changes: 4, commits: 1 });
+        assert_eq!(applied, Applied { changes: 4, commits: 3 });
         assert_eq!(
             table.rows().await.unwrap().sorted_by("id"),
             [
@@ -740,17 +757,23 @@ d,,
     async fn change_files_need_an_operation_column() {
         let lake = DeltaForce::in_memory();
         let table = cdc_table(&lake).await;
-        let mut changes = table.change_batch();
-        changes.push_file(&lake.file("never-read.csv"));
-        let config = crate::ChangesConfig::new().key("id");
-        let error = table.apply(Changes::in_memory(config, [changes])).await.unwrap_err();
+        let changes = |config: crate::ChangesConfig| {
+            // A batch first: the config is checked before it is committed.
+            let mut batch = table.change_batch();
+            batch.push(crate::Change::delete(crate::row! { "id" => 1 })).unwrap();
+            let mut changes = Changes::new(config.key("id"));
+            changes.push(batch);
+            changes.push_file(&lake.file("never-read.csv"));
+            changes
+        };
+        let config = crate::ChangesConfig::new();
+        let error = table.apply(changes(config)).await.unwrap_err();
         assert!(matches!(error, Error::InvalidConfig(_)), "{error}");
 
-        let mut changes = table.change_batch();
-        changes.push_file(&lake.file("never-read.csv"));
-        let config = crate::ChangesConfig::new().key("id").operation("Name");
-        let error = table.apply(Changes::in_memory(config, [changes])).await.unwrap_err();
+        let config = crate::ChangesConfig::new().operation("Name");
+        let error = table.apply(changes(config)).await.unwrap_err();
         assert!(error.to_string().contains("also a table column"), "{error}");
+        assert_eq!(table.version().await.unwrap(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
