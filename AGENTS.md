@@ -72,6 +72,14 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 ## Conventions
 
 - **Ingestion first.** Maintenance (compaction, vacuum) is out of scope for now.
+- **Correct, ergonomic, understandable — in that order.** Performance comes
+  later; don't add concurrency or tuning just to squeeze out speed.
+- **Code reads top to bottom.** Prefer code you can follow in order, without
+  jumping between pieces that run elsewhere (detached tasks, channels,
+  callbacks). E.g. CSV reading is a stream transform, not a task plus
+  channels: the tool isn't the point, reading in order is.
+- **Structured code.** Work lives inside the scope that starts it and ends
+  with it: no fire-and-forget tasks, nesting over spaghetti control flow.
 - **Workflow:** agree on the API, write one test, then implement.
 - **`tests/api/`**: one happy-path test per feature, written to read like
   documentation (register it in `tests/api/main.rs`). Edge cases belong in
