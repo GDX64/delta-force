@@ -103,6 +103,73 @@ impl Append {
     }
 }
 
+/// A merge in progress: every data file's live rows at one snapshot, read
+/// by [`DeltaTable::start_merge`]. [`Merge::commit`] applies a plan to them.
+pub(crate) struct Merge {
+    engine: Arc<ObjectStoreEngine>,
+    snapshot: Arc<Snapshot>,
+    metadata: Vec<ScanMetadata>,
+    /// The table's data files, with their live rows.
+    pub files: Vec<LiveFile>,
+}
+
+impl Merge {
+    /// Delete rows by position and append new rows, in one commit. Deletes
+    /// are recorded as deletion vectors; no existing data file is rewritten.
+    /// Returns the new version, or `None` if the plan is empty and nothing
+    /// was committed.
+    #[tracing::instrument(name = "commit_merge", skip_all)]
+    pub fn commit(self, plan: MergePlan) -> anyhow::Result<Option<u64>> {
+        if plan.deletes.is_empty() && plan.append.is_none() {
+            return Ok(None);
+        }
+        let engine = self.engine.as_ref();
+        let mut txn = self
+            .snapshot
+            .clone()
+            .update_table(UpdateTableOperation::Merge, ENGINE_INFO, true)
+            .build(engine, Box::new(FileSystemCommitter::new()))?;
+        let context = txn.write_state()?.write_context_builder().build()?;
+
+        if !plan.deletes.is_empty() {
+            let _span =
+                tracing::info_span!("write_deletion_vectors", files = plan.deletes.len()).entered();
+            let dv_path = context.new_deletion_vector_path("dv".into());
+            let mut buffer = Vec::new();
+            let mut descriptors = HashMap::new();
+            let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
+            for (path, positions) in plan.deletes {
+                let file = self
+                    .files
+                    .iter()
+                    .find(|f| f.path == path)
+                    .ok_or_else(|| anyhow::anyhow!("unknown data file {path}"))?;
+                let mut dv = KernelDeletionVector::new();
+                dv.add_deleted_row_indexes(file.deleted.iter().copied().chain(positions));
+                let written = writer.write_deletion_vector(dv)?;
+                descriptors.insert(path, written.to_descriptor(&dv_path));
+            }
+            writer.finalize()?;
+            engine
+                .storage_handler()
+                .put(&dv_path.absolute_path()?, buffer.into(), false)?;
+            txn.update_deletion_vectors(
+                descriptors,
+                self.metadata.into_iter().map(|m| Ok(m.scan_files)),
+            )?;
+        }
+        if let Some(batch) = plan.append {
+            let compression = compression_of(&self.snapshot);
+            txn.add_files(engine.write_data_file(batch, &context, compression)?);
+        }
+        let _span = tracing::info_span!("commit").entered();
+        Ok(Some(committed_version(txn.commit(engine)?)?))
+    }
+}
+
+/// The batches of a table scan, read as they are pulled.
+pub(crate) type ScanBatches = Box<dyn Iterator<Item = anyhow::Result<RecordBatch>> + Send>;
+
 /// A Delta table: a directory of data files plus a `_delta_log/` of commits.
 #[derive(Clone)]
 pub(crate) struct DeltaTable {
@@ -211,68 +278,11 @@ impl DeltaTable {
         })
     }
 
-    /// Merge-on-read update in one commit. `f` gets every data file's live
-    /// rows (with their row positions in the file) and returns which positions
-    /// to delete and which new rows to append. Deletes are recorded as deletion
-    /// vectors; no existing data file is rewritten. Returns the new version, or
-    /// `None` if the plan was empty and nothing was committed.
-    #[tracing::instrument(skip_all)]
-    pub fn merge<E: From<anyhow::Error>>(
-        &self,
-        f: impl FnOnce(&[LiveFile]) -> Result<MergePlan, E>,
-    ) -> Result<Option<u64>, E> {
-        let (snapshot, metadata, files) = self.live_files()?;
-        let plan = f(&files)?;
-        if plan.deletes.is_empty() && plan.append.is_none() {
-            return Ok(None);
-        }
-        let compression = compression_of(&snapshot);
-        let commit = || -> anyhow::Result<u64> {
-            let engine = self.engine.as_ref();
-            let mut txn = snapshot
-                .update_table(UpdateTableOperation::Merge, ENGINE_INFO, true)
-                .build(engine, Box::new(FileSystemCommitter::new()))?;
-            let context = txn.write_state()?.write_context_builder().build()?;
-
-            if !plan.deletes.is_empty() {
-                let _span =
-                    tracing::info_span!("write_deletion_vectors", files = plan.deletes.len())
-                        .entered();
-                let dv_path = context.new_deletion_vector_path("dv".into());
-                let mut buffer = Vec::new();
-                let mut descriptors = HashMap::new();
-                let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
-                for (path, positions) in plan.deletes {
-                    let file = files
-                        .iter()
-                        .find(|f| f.path == path)
-                        .ok_or_else(|| anyhow::anyhow!("unknown data file {path}"))?;
-                    let mut dv = KernelDeletionVector::new();
-                    dv.add_deleted_row_indexes(file.deleted.iter().copied().chain(positions));
-                    let written = writer.write_deletion_vector(dv)?;
-                    descriptors.insert(path, written.to_descriptor(&dv_path));
-                }
-                writer.finalize()?;
-                engine
-                    .storage_handler()
-                    .put(&dv_path.absolute_path()?, buffer.into(), false)?;
-                txn.update_deletion_vectors(
-                    descriptors,
-                    metadata.into_iter().map(|m| Ok(m.scan_files)),
-                )?;
-            }
-            if let Some(batch) = plan.append {
-                txn.add_files(engine.write_data_file(batch, &context, compression)?);
-            }
-            let _span = tracing::info_span!("commit").entered();
-            committed_version(txn.commit(engine)?)
-        };
-        Ok(Some(commit()?))
-    }
-
-    /// Every data file at the latest version with its live (not deleted) rows.
+    /// Start a merge-on-read update: read every data file at the latest
+    /// version with its live (not deleted) rows. Nothing is written until
+    /// [`Merge::commit`].
     #[tracing::instrument(skip_all, fields(files))]
-    fn live_files(&self) -> anyhow::Result<(Arc<Snapshot>, Vec<ScanMetadata>, Vec<LiveFile>)> {
+    pub fn start_merge(&self) -> anyhow::Result<Merge> {
         let engine = self.engine.as_ref();
         let snapshot = self.snapshot()?;
         let scan = snapshot.clone().scan_builder().build()?;
@@ -331,41 +341,42 @@ impl DeltaTable {
                 deleted,
             });
         }
-        Ok((snapshot, metadata, files))
+        Ok(Merge {
+            engine: self.engine.clone(),
+            snapshot,
+            metadata,
+            files,
+        })
     }
 
-    /// Scan the latest version one batch at a time, handing each to `f`.
-    /// Stops early when `f` returns `false`.
+    /// Scan the latest version one batch at a time. Each batch is read as
+    /// the iterator is pulled.
     #[tracing::instrument(skip_all)]
-    pub fn scan(&self, mut f: impl FnMut(RecordBatch) -> bool) -> anyhow::Result<()> {
+    pub fn scan(&self) -> anyhow::Result<ScanBatches> {
         let scan = self.snapshot()?.scan_builder().build()?;
         let mut batches = scan.execute(self.engine.clone())?;
-        while let Some(data) = tracing::info_span!("read_batch").in_scope(|| batches.next()) {
-            let batch = RecordBatch::from(ArrowEngineData::try_from_engine_data(data?)?);
-            let _span = tracing::info_span!("hand_off_batch", rows = batch.num_rows()).entered();
-            if !f(batch) {
-                break;
-            }
-        }
-        Ok(())
+        Ok(Box::new(std::iter::from_fn(move || {
+            let _span = tracing::info_span!("read_batch").entered();
+            let data = batches.next()?;
+            Some(data.map_err(anyhow::Error::from).and_then(|data| {
+                Ok(RecordBatch::from(ArrowEngineData::try_from_engine_data(
+                    data,
+                )?))
+            }))
+        })))
     }
 
     /// Row count of each data file at the latest version.
     #[cfg(test)]
     pub fn file_rows(&self) -> anyhow::Result<Vec<usize>> {
-        let (_, _, files) = self.live_files()?;
+        let files = self.start_merge()?.files;
         Ok(files.iter().map(|f| f.positions.len()).collect())
     }
 
     /// Read the whole table at its latest version.
     #[cfg(test)]
     pub fn read(&self) -> anyhow::Result<Vec<RecordBatch>> {
-        let mut batches = Vec::new();
-        self.scan(|batch| {
-            batches.push(batch);
-            true
-        })?;
-        Ok(batches)
+        self.scan()?.collect()
     }
 }
 

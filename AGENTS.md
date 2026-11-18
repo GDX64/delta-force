@@ -35,7 +35,7 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 | `src/batch.rs` | `RowBatch` / `ChangesBatch`: pushed rows as Arrow builders, pushed files read lazily |
 | `src/batch/{csv,parquet,columns}.rs` | File readers: batches of the table columns a file has (`complete` fills the rest) |
 | `src/changes.rs` | `Change`, `ChangesConfig` (schema, key, operation), `Planner`: merge planning by key |
-| `src/stream.rs` | `RowStream`: batch-at-a-time reads on a blocking thread |
+| `src/stream.rs` | `RowStream`: each batch read on a blocking thread, which takes the scan and hands it back |
 | `src/row.rs` | `Value`, `Row`, `Rows`, the `row!` macro |
 | `src/compression.rs` | Per-table codec, stored as the `delta-force.compression` property |
 | `src/delta.rs` | Internal Arrow-level table on `delta_kernel` (create, write, merge, scan) |
@@ -60,8 +60,8 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 - Batches are built from a table's `Schema` (no table needed); `write` and
   `apply` fail with `SchemaMismatch` if it isn't the table's current one.
 - Traced with `tracing` spans (the kernel's show up too); the library never
-  installs a subscriber. Spans follow work across thread hops: `blocking`,
-  `SyncObjectStore::run` and `RowStream`'s reader carry the caller's span over.
+  installs a subscriber. Spans follow work across thread hops: `blocking`
+  and `SyncObjectStore::run` carry the caller's span over.
   Per-batch spans are `trace` level, the rest `info`.
 - `ChangesBatch` keeps pushed changes and CDC files in push order. `apply`
   pulls its change stream from inside the merge's blocking thread
@@ -87,7 +87,8 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 - **`tests/api/`**: one happy-path test per feature, written to read like
   documentation (register it in `tests/api/main.rs`). Edge cases belong in
   unit tests next to the code.
-- Run `cargo test` and `cargo clippy --all-targets` (no warnings) before committing.
+- Run `cargo fmt` on every file you change, and `cargo test` and
+  `cargo clippy --all-targets` (no warnings) before committing.
 
 ## Dev commands
 

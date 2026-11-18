@@ -13,8 +13,8 @@ use tracing::Instrument;
 use url::Url;
 
 use crate::batch::{ChangesBatch, RowBatch, split_rows};
-use crate::changes::Planner;
-use crate::delta::{Append, DeltaTable, MergePlan, Settings};
+use crate::changes::{Location, Planner};
+use crate::delta::{Append, DeltaTable, LiveFile, MergePlan, Settings};
 use crate::engine::ObjectStoreEngine;
 use crate::stream::RowStream;
 use crate::{Compression, Error, LakeFile, Result, Row, Rows, Value};
@@ -387,56 +387,45 @@ impl Table {
         let runtime = tokio::runtime::Handle::current();
         blocking(move || {
             schema.check(&table_columns(&inner.arrow_schema()?)?)?;
+            let merge = inner.start_merge()?;
+
+            let plan_span =
+                tracing::info_span!("plan_merge", changes = tracing::field::Empty).entered();
+            let existing = tracing::info_span!("index_existing_rows")
+                .in_scope(|| existing_rows(&merge.files))?;
+            let mut planner = Planner::new(existing, &key)?;
             let mut applied = Applied::default();
-            applied.version = inner.merge(|files| {
-                let plan_span =
-                    tracing::info_span!("plan_merge", changes = tracing::field::Empty).entered();
-                let index_span = tracing::info_span!("index_existing_rows").entered();
-                let mut existing = Vec::new();
-                for (index, file) in files.iter().enumerate() {
-                    let mut positions = file.positions.iter();
-                    for batch in &file.data {
-                        for row in batch_rows(batch)? {
-                            let position = *positions.next().expect("one position per row");
-                            existing.push(((index, position), row));
-                        }
-                    }
+            loop {
+                let next = tracing::trace_span!("next_changes")
+                    .in_scope(|| runtime.block_on(changes.next()));
+                let Some(chunk) = next else { break };
+                let chunk = chunk?;
+                let _span = tracing::trace_span!("plan_changes", changes = chunk.len()).entered();
+                for change in chunk {
+                    planner.apply(change)?;
+                    applied.changes += 1;
                 }
-                let mut planner = Planner::new(existing, &key)?;
-                drop(index_span);
-                loop {
-                    let next = tracing::trace_span!("next_changes")
-                        .in_scope(|| runtime.block_on(changes.next()));
-                    let Some(chunk) = next else { break };
-                    let chunk = chunk?;
-                    let _span =
-                        tracing::trace_span!("plan_changes", changes = chunk.len()).entered();
-                    for change in chunk {
-                        planner.apply(change)?;
-                        applied.changes += 1;
-                    }
+            }
+            plan_span.record("changes", applied.changes);
+            let plan = planner.finish();
+
+            // Planned locations become row positions per data file.
+            let mut merge_plan = MergePlan::default();
+            for (index, position) in plan.delete {
+                let path = merge.files[index].path.clone();
+                merge_plan.deletes.entry(path).or_default().push(position);
+            }
+            if !plan.append.is_empty() {
+                let _span = tracing::info_span!("build_append", rows = plan.append.len()).entered();
+                let mut rows = RowBatch::new(schema.clone());
+                for row in plan.append {
+                    rows.push(row)?;
                 }
-                plan_span.record("changes", applied.changes);
-                let plan = planner.finish();
-                let mut merge = MergePlan::default();
-                for (index, position) in plan.delete {
-                    merge
-                        .deletes
-                        .entry(files[index].path.clone())
-                        .or_default()
-                        .push(position);
-                }
-                if !plan.append.is_empty() {
-                    let _span =
-                        tracing::info_span!("build_append", rows = plan.append.len()).entered();
-                    let mut rows = RowBatch::new(schema.clone());
-                    for row in plan.append {
-                        rows.push(row)?;
-                    }
-                    merge.append = Some(rows.finish()?);
-                }
-                Ok::<_, Error>(merge)
-            })?;
+                merge_plan.append = Some(rows.finish()?);
+            }
+            drop(plan_span);
+
+            applied.version = merge.commit(merge_plan)?;
             Ok(applied)
         })
         .await
@@ -469,9 +458,26 @@ pub struct Applied {
     pub version: Option<u64>,
 }
 
+/// Every live row of `files`, with its location: (file index, row position).
+fn existing_rows(files: &[LiveFile]) -> Result<Vec<(Location, Row)>> {
+    let mut existing = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        let mut positions = file.positions.iter();
+        for batch in &file.data {
+            for row in batch_rows(batch)? {
+                let position = *positions.next().expect("one position per row");
+                existing.push(((index, position), row));
+            }
+        }
+    }
+    Ok(existing)
+}
+
 /// The kernel is synchronous; run it off the async worker threads, inside
 /// the caller's span so traces show it as the caller's work.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+pub(crate) async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     let span = tracing::Span::current();
     tokio::task::spawn_blocking(move || span.in_scope(f))
         .await
