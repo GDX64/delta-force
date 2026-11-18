@@ -9,6 +9,7 @@ use delta_kernel::arrow::csv::ReaderBuilder;
 use delta_kernel::arrow::csv::reader::Format;
 use futures_util::stream::{self, StreamExt};
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use super::Batches;
 use super::columns::{assemble, match_columns};
@@ -24,6 +25,7 @@ const BATCHES_IN_FLIGHT: usize = 2;
 /// Read `file` as CSV with a header row, as a stream of batches in the
 /// table's columns. The file is downloaded and parsed chunk by chunk, never
 /// held whole.
+#[tracing::instrument(name = "open_csv", skip_all, fields(path = file.path()))]
 pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Batches> {
     let mut download = file.chunks().await?;
     let (send_bytes, mut receive_bytes) = mpsc::channel::<Bytes>(IN_FLIGHT);
@@ -31,18 +33,32 @@ pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Bat
 
     // Parsing is CPU work: run it on a blocking thread while we download.
     let (columns, path, parsed) = (columns.clone(), file.path().to_owned(), send_batch.clone());
+    let span = tracing::info_span!("parse_csv", path = %path);
     tokio::task::spawn_blocking(move || {
-        let chunks = std::iter::from_fn(|| receive_bytes.blocking_recv());
+        let _span = span.entered();
+        let chunks = std::iter::from_fn(|| {
+            tracing::trace_span!("wait_for_chunk").in_scope(|| receive_bytes.blocking_recv())
+        });
         // A send fails when the reader stopped listening: stop parsing.
-        let emit = |batch| parsed.blocking_send(Ok(batch)).is_ok();
+        let emit = |batch: RecordBatch| {
+            tracing::trace_span!("wait_to_hand_off", rows = batch.num_rows())
+                .in_scope(|| parsed.blocking_send(Ok(batch)).is_ok())
+        };
         if let Err(message) = parse(chunks, &columns, emit) {
             let _ = parsed.blocking_send(Err(Error::InvalidFile { file: path, message }));
         }
     });
-    tokio::spawn(async move {
-        while let Some(chunk) = download.next().await {
+    let span = tracing::info_span!("download_csv", path = file.path());
+    let download = async move {
+        loop {
+            let next = download.next().instrument(tracing::trace_span!("get_chunk")).await;
+            let Some(chunk) = next else { break };
             let sent = match chunk {
-                Ok(chunk) => send_bytes.send(chunk).await.is_ok(),
+                Ok(chunk) => send_bytes
+                    .send(chunk)
+                    .instrument(tracing::trace_span!("wait_for_parser"))
+                    .await
+                    .is_ok(),
                 Err(e) => {
                     let _ = send_batch.send(Err(e)).await;
                     false
@@ -53,7 +69,8 @@ pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Bat
                 return;
             }
         }
-    });
+    };
+    tokio::spawn(download.instrument(span));
 
     let batches = stream::unfold(receive_batch, |mut receive| async move {
         receive.recv().await.map(|batch| (batch, receive))
@@ -104,14 +121,20 @@ fn parse(
             // An empty buffer at the end tells the decoder the input is over.
             buffer = chunks.next().unwrap_or_default();
         }
-        let decoded = decoder.decode(&buffer).map_err(|e| e.to_string())?;
+        let decoded = tracing::trace_span!("decode", bytes = buffer.len())
+            .in_scope(|| decoder.decode(&buffer))
+            .map_err(|e| e.to_string())?;
         buffer.advance(decoded);
         // 0 means a full batch or the end of the input.
         if decoded == 0 || decoder.capacity() == 0 {
-            match decoder.flush().map_err(|e| e.to_string())? {
+            let flushed = tracing::trace_span!("build_batch").in_scope(|| {
+                let Some(batch) = decoder.flush()? else { return Ok(None) };
+                let take = |i: usize| Ok(batch.column(i).clone());
+                Ok(Some(assemble(columns, &source, take, batch.num_rows())))
+            });
+            match flushed.map_err(|e: delta_kernel::arrow::error::ArrowError| e.to_string())? {
                 Some(batch) => {
-                    let take = |i: usize| Ok(batch.column(i).clone());
-                    if !emit(assemble(columns, &source, take, batch.num_rows())?) {
+                    if !emit(batch?) {
                         return Ok(());
                     }
                 }

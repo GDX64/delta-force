@@ -53,6 +53,19 @@ def profile(args: argparse.Namespace) -> int:
     )
 
 
+def trace(args: argparse.Namespace) -> int:
+    """Record a timeline of the benchmark's spans, to open in Perfetto."""
+    output = ROOT / "target" / "bench" / "trace.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    code = run(
+        "cargo", "run", "--release", "--features", "test-util",
+        "--example", "ingest_1gb", "--", args.size, "--trace", str(output),
+    )
+    if code == 0:
+        print(f"open {output} in https://ui.perfetto.dev (drag the file in; it stays local)")
+    return code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="dev", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -64,6 +77,10 @@ def main() -> int:
     prof = commands.add_parser("profile", help=profile.__doc__, description=profile.__doc__)
     prof.add_argument("size", nargs="?", default="1GB", help="source file size, e.g. 100MB (default: 1GB)")
     prof.set_defaults(run=profile)
+
+    tr = commands.add_parser("trace", help=trace.__doc__, description=trace.__doc__)
+    tr.add_argument("size", nargs="?", default="1GB", help="source file size, e.g. 100MB (default: 1GB)")
+    tr.set_defaults(run=trace)
 
     args = parser.parse_args()
     return args.run(args)

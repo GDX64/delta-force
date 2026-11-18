@@ -8,6 +8,7 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::compute::concat_batches;
 use futures_util::StreamExt;
+use tracing::Instrument;
 use object_store::ObjectStore;
 use url::Url;
 
@@ -204,6 +205,7 @@ impl Lake {
     }
 
     /// Create a new table. Fails with [`Error::TableExists`] if it exists.
+    #[tracing::instrument(skip_all, fields(table = %config.name))]
     pub async fn create(&self, config: TableConfig) -> Result<Table> {
         validate_columns(&config.columns)?;
         if config.settings.rows_per_file == 0 {
@@ -233,6 +235,7 @@ impl Lake {
     }
 
     /// Open an existing table. Fails with [`Error::TableNotFound`] if missing.
+    #[tracing::instrument(skip(self))]
     pub async fn table(&self, name: &str) -> Result<Table> {
         let inner = self.delta_table(name)?;
         let (probe, owned) = (inner.clone(), name.to_owned());
@@ -303,6 +306,7 @@ impl Table {
     }
 
     /// The latest committed version.
+    #[tracing::instrument(skip_all, fields(table = %self.name))]
     pub async fn version(&self) -> Result<u64> {
         let (inner, name) = (self.inner.clone(), self.name.clone());
         blocking(move || inner.version()?.ok_or(Error::TableNotFound(name))).await
@@ -315,6 +319,7 @@ impl Table {
     /// memory holds about one data file. Readers see none of them until the
     /// commit. On error nothing is committed. Fails with
     /// [`Error::SchemaMismatch`] if the batch's schema isn't the table's.
+    #[tracing::instrument(skip_all, fields(table = %self.name, files, rows))]
     pub async fn write(&self, batch: RowBatch) -> Result<u64> {
         if batch.is_empty() {
             return Err(Error::NoRows);
@@ -328,9 +333,11 @@ impl Table {
         })
         .await?;
         let mut rows = batch.into_stream();
-        let (mut pending, mut files) = (Vec::new(), 0);
-        while let Some(batch) = rows.next().await {
-            pending.push(batch?);
+        let (mut pending, mut files, mut total) = (Vec::new(), 0, 0);
+        while let Some(batch) = rows.next().instrument(tracing::trace_span!("next_batch")).await {
+            let batch = batch?;
+            total += batch.num_rows();
+            pending.push(batch);
             while row_count(&pending) >= rows_per_file {
                 let (file, rest) = split_rows(&pending, rows_per_file);
                 pending = rest;
@@ -342,6 +349,7 @@ impl Table {
             append = write_file(append, pending).await?;
             files += 1;
         }
+        tracing::Span::current().record("files", files).record("rows", total);
         if files == 0 {
             return Err(Error::NoRows);
         }
@@ -355,6 +363,7 @@ impl Table {
     ///
     /// Merge-on-read: replaced and deleted rows are marked in deletion
     /// vectors and new values are appended; existing files aren't rewritten.
+    #[tracing::instrument(skip_all, fields(table = %self.name))]
     pub async fn apply(&self, changes: ChangesBatch) -> Result<Applied> {
         if changes.is_empty() {
             return Ok(Applied::default());
@@ -370,6 +379,8 @@ impl Table {
             schema.check(&table_columns(&inner.arrow_schema()?)?)?;
             let mut applied = Applied::default();
             applied.version = inner.merge(|files| {
+                let plan_span = tracing::info_span!("plan_merge", changes = tracing::field::Empty).entered();
+                let index_span = tracing::info_span!("index_existing_rows").entered();
                 let mut existing = Vec::new();
                 for (index, file) in files.iter().enumerate() {
                     let mut positions = file.positions.iter();
@@ -381,18 +392,26 @@ impl Table {
                     }
                 }
                 let mut planner = Planner::new(existing, &key)?;
-                while let Some(chunk) = runtime.block_on(changes.next()) {
-                    for change in chunk? {
+                drop(index_span);
+                loop {
+                    let next = tracing::trace_span!("next_changes")
+                        .in_scope(|| runtime.block_on(changes.next()));
+                    let Some(chunk) = next else { break };
+                    let chunk = chunk?;
+                    let _span = tracing::trace_span!("plan_changes", changes = chunk.len()).entered();
+                    for change in chunk {
                         planner.apply(change)?;
                         applied.changes += 1;
                     }
                 }
+                plan_span.record("changes", applied.changes);
                 let plan = planner.finish();
                 let mut merge = MergePlan::default();
                 for (index, position) in plan.delete {
                     merge.deletes.entry(files[index].path.clone()).or_default().push(position);
                 }
                 if !plan.append.is_empty() {
+                    let _span = tracing::info_span!("build_append", rows = plan.append.len()).entered();
                     let mut rows = RowBatch::new(schema.clone());
                     for row in plan.append {
                         rows.push(row)?;
@@ -433,9 +452,11 @@ pub struct Applied {
     pub version: Option<u64>,
 }
 
-/// The kernel is synchronous; run it off the async worker threads.
+/// The kernel is synchronous; run it off the async worker threads, inside
+/// the caller's span so traces show it as the caller's work.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(f)
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(f))
         .await
         .map_err(|e| Error::Storage(e.into()))?
 }
@@ -507,10 +528,12 @@ pub(crate) fn batch_rows(batch: &RecordBatch) -> Result<Vec<Row>> {
 }
 
 /// Write `rows` as one data file of `append`, uncommitted.
+#[tracing::instrument(skip_all, fields(rows = row_count(&rows)))]
 async fn write_file(mut append: Append, rows: Vec<RecordBatch>) -> Result<Append> {
     blocking(move || {
-        let batch =
-            concat_batches(&rows[0].schema(), &rows).map_err(|e| Error::Storage(e.into()))?;
+        let batch = tracing::info_span!("concat_batches").in_scope(|| {
+            concat_batches(&rows[0].schema(), &rows).map_err(|e| Error::Storage(e.into()))
+        })?;
         append.write_file(batch)?;
         Ok(append)
     })

@@ -81,6 +81,7 @@ impl Append {
     }
 
     /// Write `batch` as a data file of this append, uncommitted.
+    #[tracing::instrument(skip_all, fields(rows = batch.num_rows()))]
     pub fn write_file(&mut self, batch: RecordBatch) -> anyhow::Result<()> {
         let add = self.engine.write_data_file(batch, &self.context, self.compression)?;
         self.txn.add_files(add);
@@ -88,6 +89,7 @@ impl Append {
     }
 
     /// Commit every data file written so far. Returns the version.
+    #[tracing::instrument(skip_all)]
     pub fn commit(self) -> anyhow::Result<u64> {
         committed_version(self.txn.commit(self.engine.as_ref())?)
     }
@@ -111,6 +113,7 @@ impl DeltaTable {
         Self { engine, url: root }
     }
 
+    #[tracing::instrument(skip_all)]
     fn snapshot(&self) -> delta_kernel::KernelResult<Arc<Snapshot>> {
         Snapshot::builder_for(self.url.as_str()).build(self.engine.as_ref())
     }
@@ -149,6 +152,7 @@ impl DeltaTable {
 
     /// Create the table with the given schema. Returns the new version (0).
     /// Fails if the table already exists.
+    #[tracing::instrument(name = "create_table", skip_all)]
     pub fn create(&self, schema: &Schema, settings: Settings) -> anyhow::Result<u64> {
         // The kernel requires a local table directory to exist up front.
         if self.url.scheme() == "file" {
@@ -181,6 +185,7 @@ impl DeltaTable {
 
     /// Start an append: the log is read once, here, for every data file
     /// written and for the commit.
+    #[tracing::instrument(name = "start_append", skip_all)]
     pub fn append(&self) -> anyhow::Result<Append> {
         let snapshot = self.snapshot()?;
         let compression = compression_of(&snapshot);
@@ -197,6 +202,7 @@ impl DeltaTable {
     /// to delete and which new rows to append. Deletes are recorded as deletion
     /// vectors; no existing data file is rewritten. Returns the new version, or
     /// `None` if the plan was empty and nothing was committed.
+    #[tracing::instrument(skip_all)]
     pub fn merge<E: From<anyhow::Error>>(
         &self,
         f: impl FnOnce(&[LiveFile]) -> Result<MergePlan, E>,
@@ -215,6 +221,8 @@ impl DeltaTable {
             let context = txn.write_state()?.write_context_builder().build()?;
 
             if !plan.deletes.is_empty() {
+                let _span = tracing::info_span!("write_deletion_vectors", files = plan.deletes.len())
+                    .entered();
                 let dv_path = context.new_deletion_vector_path("dv".into());
                 let mut buffer = Vec::new();
                 let mut descriptors = HashMap::new();
@@ -241,19 +249,23 @@ impl DeltaTable {
             if let Some(batch) = plan.append {
                 txn.add_files(engine.write_data_file(batch, &context, compression)?);
             }
+            let _span = tracing::info_span!("commit").entered();
             committed_version(txn.commit(engine)?)
         };
         Ok(Some(commit()?))
     }
 
     /// Every data file at the latest version with its live (not deleted) rows.
+    #[tracing::instrument(skip_all, fields(files))]
     fn live_files(
         &self,
     ) -> anyhow::Result<(Arc<Snapshot>, Vec<ScanMetadata>, Vec<LiveFile>)> {
         let engine = self.engine.as_ref();
         let snapshot = self.snapshot()?;
         let scan = snapshot.clone().scan_builder().build()?;
-        let metadata = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+        let metadata = tracing::info_span!("scan_metadata")
+            .in_scope(|| scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>())?;
+        tracing::Span::current().record("files", metadata.len());
         let mut scan_files = Vec::new();
         for m in &metadata {
             scan_files = m.visit_scan_files(scan_files, |acc: &mut Vec<ScanFile>, f| acc.push(f))?;
@@ -263,6 +275,7 @@ impl DeltaTable {
         let logical = scan.logical_schema().clone();
         let mut files = Vec::with_capacity(scan_files.len());
         for file in scan_files {
+            let _span = tracing::info_span!("read_live_file", path = %file.path).entered();
             let deleted: Vec<u64> = file
                 .dv_info
                 .get_row_indexes(engine, &self.url)?
@@ -302,10 +315,13 @@ impl DeltaTable {
 
     /// Scan the latest version one batch at a time, handing each to `f`.
     /// Stops early when `f` returns `false`.
+    #[tracing::instrument(skip_all)]
     pub fn scan(&self, mut f: impl FnMut(RecordBatch) -> bool) -> anyhow::Result<()> {
         let scan = self.snapshot()?.scan_builder().build()?;
-        for data in scan.execute(self.engine.clone())? {
+        let mut batches = scan.execute(self.engine.clone())?;
+        while let Some(data) = tracing::info_span!("read_batch").in_scope(|| batches.next()) {
             let batch = RecordBatch::from(ArrowEngineData::try_from_engine_data(data?)?);
+            let _span = tracing::info_span!("hand_off_batch", rows = batch.num_rows()).entered();
             if !f(batch) {
                 break;
             }

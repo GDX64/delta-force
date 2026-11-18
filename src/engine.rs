@@ -74,6 +74,7 @@ impl ObjectStoreEngine {
     ///
     /// Not part of the [`Engine`] trait: the kernel leaves "how do I turn my
     /// data into a data file" entirely to the engine.
+    #[tracing::instrument(skip_all, fields(rows = batch.num_rows()))]
     pub fn write_data_file(
         &self,
         batch: RecordBatch,
@@ -81,6 +82,7 @@ impl ObjectStoreEngine {
         compression: Compression,
     ) -> KernelResult<Box<dyn EngineData>> {
         // Logical -> physical (column mapping, partition columns, ...).
+        let span = tracing::info_span!("to_physical").entered();
         let input_schema = StructType::try_from_arrow(batch.schema().as_ref())?;
         let physical = self
             .evaluation
@@ -91,12 +93,15 @@ impl ObjectStoreEngine {
             )?
             .evaluate(&ArrowEngineData::new(batch))?;
         let physical: RecordBatch = (*ArrowEngineData::try_from_engine_data(physical)?).into();
+        drop(span);
 
-        let stats = collect_stats(
-            &physical,
-            context.stats_columns(),
-            context.physical_data_schema().as_ref(),
-        )?;
+        let stats = tracing::info_span!("collect_stats").in_scope(|| {
+            collect_stats(
+                &physical,
+                context.stats_columns(),
+                context.physical_data_schema().as_ref(),
+            )
+        })?;
 
         let mut dir = context.write_dir();
         if !dir.path().ends_with('/') {
@@ -319,11 +324,14 @@ impl StoreParquet {
             .with_properties(properties);
 
         let mut buffer = Vec::new();
+        let span = tracing::info_span!("encode_parquet", bytes = tracing::field::Empty).entered();
         let mut writer = ArrowWriter::try_new_with_options(&mut buffer, first.schema(), options)?;
         for batch in batches {
             writer.write(batch)?;
         }
         writer.close()?; // writes the footer
+        span.record("bytes", buffer.len());
+        drop(span);
         let size = buffer.len() as FileSize;
         put(&self.io, location, buffer.into(), true)?;
         Ok(size)

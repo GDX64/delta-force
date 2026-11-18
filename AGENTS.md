@@ -59,6 +59,10 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
   the whole write, so the log is read once. Zstd by default.
 - Batches are built from a table's `Schema` (no table needed); `write` and
   `apply` fail with `SchemaMismatch` if it isn't the table's current one.
+- Traced with `tracing` spans (the kernel's show up too); the library never
+  installs a subscriber. Spans follow work across thread hops: `blocking`,
+  `SyncObjectStore::run` and the file readers carry the caller's span over.
+  Per-batch spans are `trace` level, the rest `info`.
 - `ChangesBatch` keeps pushed changes and CDC files in push order. `apply`
   pulls its change stream from inside the merge's blocking thread
   (`Handle::block_on`) and folds each change into the `Planner`, so a CDC
@@ -82,5 +86,7 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
 |---|---|
 | `./dev benchmark [size]` | Ingests a generated CSV (default `1GB`, e.g. `100MB`) and reports wall time, CPU and peak memory. Source: `examples/ingest_1gb.rs`, which uses `TestStore` virtual files (`test-util` feature). |
 | `./dev profile [size]` | Records a CPU profile of the same benchmark with [samply](https://github.com/mstange/samply) (`cargo install --locked samply`; on Windows it also needs xperf from the Windows Performance Toolkit, and an administrator terminal) and opens it in the Firefox Profiler. Saved to `target/bench/profile.json.gz`; builds with the `profiling` cargo profile (release + debug symbols). |
+
+| `./dev trace [size]` | Records a timeline of the same benchmark's `tracing` spans to `target/bench/trace.json` (Chrome trace format). Drag it into [Perfetto](https://ui.perfetto.dev) to see each thread's spans: what runs when, and what waits on what. |
 
 Add new commands to `dev.py`.

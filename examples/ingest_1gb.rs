@@ -5,7 +5,11 @@
 //! ```text
 //! cargo run --release --example ingest_1gb            # 1 GB
 //! cargo run --release --example ingest_1gb -- 100MB
+//! cargo run --release --example ingest_1gb -- 100MB --trace trace.json
 //! ```
+//!
+//! `--trace` records the library's spans as a Chrome trace: open it in
+//! <https://ui.perfetto.dev>.
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::time::Instant;
@@ -22,7 +26,18 @@ const ROW: u64 = 33;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let size = parse_size(&std::env::args().nth(1).unwrap_or("1GB".into()))?;
+    let mut size = "1GB".to_owned();
+    let mut trace = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--trace" => trace = Some(args.next().ok_or(anyhow::anyhow!("--trace needs a path"))?),
+            _ => size = arg,
+        }
+    }
+    // Flushes the trace file when dropped, at the end of `main`.
+    let _trace = trace.map(start_trace);
+    let size = parse_size(&size)?;
     let rows = (size - HEADER.len() as u64) / ROW;
     let size = HEADER.len() as u64 + rows * ROW;
 
@@ -36,7 +51,8 @@ async fn main() -> anyhow::Result<()> {
                 .column("id", DataType::Long)
                 .column("name", DataType::String)
                 .column("score", DataType::Double)
-                .column("count", DataType::Integer),
+                .column("count", DataType::Integer)
+                .rows_per_file(1_000_000),
         )
         .await?;
 
@@ -82,7 +98,10 @@ async fn main() -> anyhow::Result<()> {
     );
     for (path, file) in &io.files {
         let old = io_before.files.get(path).copied().unwrap_or_default();
-        let (gets, puts) = (file.reads.gets - old.reads.gets, file.writes.puts - old.writes.puts);
+        let (gets, puts) = (
+            file.reads.gets - old.reads.gets,
+            file.writes.puts - old.writes.puts,
+        );
         let read = human(file.reads.bytes - old.reads.bytes);
         let written = human(file.writes.bytes - old.writes.bytes);
         if gets > 0 {
@@ -93,6 +112,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Record spans to a Chrome trace file: ours in full, other crates' (the
+/// kernel's) at info and above.
+fn start_trace(path: String) -> tracing_chrome::FlushGuard {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::prelude::*;
+
+    let (chrome, guard) = tracing_chrome::ChromeLayerBuilder::new()
+        .file(&path)
+        .include_args(true)
+        .build();
+    let filter = Targets::new()
+        .with_default(LevelFilter::INFO)
+        .with_target("delta_force", LevelFilter::TRACE);
+    tracing_subscriber::registry()
+        .with(chrome.with_filter(filter))
+        .init();
+    println!("trace        {path}");
+    guard
 }
 
 /// The bytes of `range` of the generated CSV.

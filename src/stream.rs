@@ -58,10 +58,14 @@ impl RowStream {
         };
         let table = table.clone();
         let (tx, rx) = mpsc::channel(BUFFER);
+        let span = tracing::info_span!("row_stream");
         let reader = tokio::task::spawn_blocking(move || {
+            let _span = span.entered();
             let scanned = table.scan(|batch| {
                 // `false` once the consumer is gone: stop reading.
-                tx.blocking_send(batch_rows(&batch).map(Rows::from)).is_ok()
+                let rows = tracing::info_span!("to_rows").in_scope(|| batch_rows(&batch));
+                tracing::trace_span!("wait_for_consumer")
+                    .in_scope(|| tx.blocking_send(rows.map(Rows::from)).is_ok())
             });
             if let Err(e) = scanned {
                 let _ = tx.blocking_send(Err(e.into()));

@@ -24,6 +24,7 @@ use crate::{Error, Result};
 
 /// Read `file` as Parquet, as a stream of batches in the table's columns.
 /// Only the footer and the column data are fetched, with ranged reads.
+#[tracing::instrument(name = "open_parquet", skip_all, fields(path = file.path()))]
 pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Batches> {
     let path = file.path().to_owned();
     let invalid = move |message: String| Error::InvalidFile { file: path.clone(), message };
@@ -57,6 +58,7 @@ pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Bat
     Ok(stream
         .map(move |batch| {
             let batch = batch.map_err(storage)?;
+            let _span = tracing::trace_span!("convert_batch", rows = batch.num_rows()).entered();
             let convert = |i: usize| -> Result<ArrayRef, String> {
                 let target = columns[source.iter().position(|s| *s == Some(i)).unwrap()].data_type;
                 // `safe: false`: a value that doesn't fit is an error, not a null.
