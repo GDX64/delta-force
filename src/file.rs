@@ -2,12 +2,16 @@
 use std::fmt;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures_util::stream::{BoxStream, StreamExt};
+use bytes::{Bytes, BytesMut};
+use futures_util::stream::{self, BoxStream, Stream, StreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::{Error, Result};
+
+/// Chunks of a file are joined up to at least this many bytes before they
+/// are handed on, however small the store's own pieces are.
+const CHUNK_SIZE: usize = 1 << 23;
 
 /// A file in the lake, addressed by its path relative to the lake root.
 /// Get one with [`Lake::file`](crate::Lake::file).
@@ -72,7 +76,8 @@ impl LakeFile {
         Ok(meta.size)
     }
 
-    /// The file's contents as a stream of chunks, fetched as they are read.
+    /// The file's contents as a stream of chunks of at least 1 MiB (the
+    /// last may be smaller), fetched as they are read.
     pub(crate) async fn chunks(&self) -> Result<BoxStream<'static, Result<Bytes>>> {
         let object = self
             .store
@@ -80,10 +85,10 @@ impl LakeFile {
             .await
             .map_err(|e| self.error(e))?;
         let this = self.clone();
-        Ok(object
+        let pieces = object
             .into_stream()
-            .map(move |chunk| chunk.map_err(|e| this.error(e)))
-            .boxed())
+            .map(move |piece| piece.map_err(|e| this.error(e)));
+        Ok(join_pieces(pieces, CHUNK_SIZE).boxed())
     }
 
     pub(crate) async fn put(&self, contents: Vec<u8>) -> Result<()> {
@@ -102,8 +107,76 @@ impl LakeFile {
     }
 }
 
+/// Join `pieces` into chunks of at least `size` bytes, or until the stream
+/// ends. A piece that is already big enough is passed on as it is.
+fn join_pieces(
+    pieces: impl Stream<Item = Result<Bytes>> + Send + 'static,
+    size: usize,
+) -> impl Stream<Item = Result<Bytes>> {
+    // Fused: after the last chunk the stream is polled once more.
+    let pieces = pieces.boxed().fuse();
+    stream::try_unfold(pieces, move |mut pieces| async move {
+        let mut chunk = BytesMut::new();
+        while chunk.len() < size {
+            let Some(piece) = pieces.next().await else {
+                break;
+            };
+            let piece = piece?;
+            if chunk.is_empty() && piece.len() >= size {
+                return Ok(Some((piece, pieces)));
+            }
+            chunk.extend_from_slice(&piece);
+        }
+        Ok((!chunk.is_empty()).then(|| (chunk.freeze(), pieces)))
+    })
+}
+
 impl fmt::Debug for LakeFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("LakeFile").field(&self.path).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn join(pieces: &[&'static [u8]], size: usize) -> Vec<Vec<u8>> {
+        let pieces: Vec<_> = pieces.iter().map(|p| Ok(Bytes::from_static(p))).collect();
+        let pieces = stream::iter(pieces);
+        join_pieces(pieces, size)
+            .map(|chunk| chunk.unwrap().to_vec())
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn small_pieces_are_joined_up_to_the_chunk_size() {
+        let chunks = join(&[b"ab", b"cd", b"ef", b"g"], 4).await;
+        assert_eq!(chunks, [b"abcd".to_vec(), b"efg".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn big_pieces_pass_through_whole() {
+        let chunks = join(&[b"a", b"bcdefgh", b"ijklmno"], 4).await;
+        assert_eq!(chunks, [b"abcdefgh".to_vec(), b"ijklmno".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn empty_files_have_no_chunks() {
+        assert!(join(&[], 4).await.is_empty());
+        assert!(join(&[b""], 4).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn errors_end_the_stream() {
+        let pieces = stream::iter([
+            Ok(Bytes::from_static(b"ab")),
+            Err(Error::FileNotFound("x".into())),
+            Ok(Bytes::from_static(b"cd")),
+        ]);
+        let chunks: Vec<_> = join_pieces(pieces, 4).collect().await;
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_err());
     }
 }

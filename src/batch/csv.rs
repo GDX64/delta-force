@@ -154,14 +154,13 @@ impl Parser {
 
     /// Decode all of `chunk`, flushing each batch as it fills up. The
     /// decoder takes input while it has room, so each pass makes progress.
+    #[tracing::instrument(skip_all, fields(bytes = chunk.len()))]
     fn decode(&mut self, mut chunk: Bytes, out: &mut VecDeque<RecordBatch>) -> Result<(), String> {
         loop {
             let State::Rows { decoder, .. } = &mut self.state else {
                 unreachable!("decoding starts after the header")
             };
-            let decoded = tracing::trace_span!("decode", bytes = chunk.len())
-                .in_scope(|| decoder.decode(&chunk))
-                .map_err(|e| e.to_string())?;
+            let decoded = decoder.decode(&chunk).map_err(|e| e.to_string())?;
             chunk.advance(decoded);
             if decoder.capacity() == 0 {
                 self.flush(out)?;
@@ -177,7 +176,6 @@ impl Parser {
         let State::Rows { decoder, source } = &mut self.state else {
             unreachable!("decoding starts after the header")
         };
-        let _span = tracing::trace_span!("build_batch").entered();
         if let Some(batch) = decoder.flush().map_err(|e| e.to_string())? {
             let take = |i: usize| Ok(batch.column(i).clone());
             out.push_back(assemble(&self.columns, source, take, batch.num_rows())?);
