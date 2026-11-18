@@ -80,6 +80,9 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
   channels: the tool isn't the point, reading in order is.
 - **Structured code.** Work lives inside the scope that starts it and ends
   with it: no fire-and-forget tasks, nesting over spaghetti control flow.
+- **Ownership over shared mutable state.** Move values to whoever works on
+  them and hand them back (like `write_file` takes and returns the
+  `Append`) instead of sharing them behind `Arc<Mutex<T>>`.
 - **Workflow:** agree on the API, write one test, then implement.
 - **`tests/api/`**: one happy-path test per feature, written to read like
   documentation (register it in `tests/api/main.rs`). Edge cases belong in
