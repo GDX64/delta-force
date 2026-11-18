@@ -45,7 +45,10 @@ pub(super) fn assemble(
         if let Some(i) = *source {
             let array = take(i)?;
             if !column.nullable && array.null_count() > 0 {
-                return Err(format!("required column {:?} has empty values", column.name));
+                return Err(format!(
+                    "required column {:?} has empty values",
+                    column.name
+                ));
             }
             present.push(column.clone());
             arrays.push(array);

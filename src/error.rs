@@ -28,7 +28,10 @@ pub enum Error {
     /// A lake file whose format can't be read (by extension).
     UnsupportedFormat(String),
     /// A lake file whose contents don't fit the table.
-    InvalidFile { file: String, message: String },
+    InvalidFile {
+        file: String,
+        message: String,
+    },
     /// An insert used a key that already exists (or the table has duplicates).
     DuplicateKey(String),
     /// An update used a key that doesn't exist.
@@ -46,7 +49,11 @@ impl fmt::Display for Error {
             Error::InvalidSchema(m) => write!(f, "invalid schema: {m}"),
             Error::ColumnNotFound(c) => write!(f, "column {c:?} not found"),
             Error::MissingValue(c) => write!(f, "column {c:?} is not nullable but has no value"),
-            Error::TypeMismatch { column, expected, found } => {
+            Error::TypeMismatch {
+                column,
+                expected,
+                found,
+            } => {
                 write!(f, "column {column:?}: expected {expected}, found {found}")
             }
             Error::SchemaMismatch => {

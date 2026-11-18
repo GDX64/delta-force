@@ -32,7 +32,9 @@ enum State {
 
 impl RowStream {
     pub(crate) fn new(table: DeltaTable) -> Self {
-        Self { state: State::NotStarted(table) }
+        Self {
+            state: State::NotStarted(table),
+        }
     }
 
     /// The next batch of rows, or `None` once the table has been read.
@@ -45,7 +47,10 @@ impl RowStream {
             Some(rows) => rows.map(Some),
             // The reader finished: surface a panic instead of ending quietly.
             None => match reader.take() {
-                Some(handle) => handle.await.map(|()| None).map_err(|e| Error::Storage(e.into())),
+                Some(handle) => handle
+                    .await
+                    .map(|()| None)
+                    .map_err(|e| Error::Storage(e.into())),
                 None => Ok(None),
             },
         }
@@ -71,7 +76,10 @@ impl RowStream {
                 let _ = tx.blocking_send(Err(e.into()));
             }
         });
-        self.state = State::Reading { rx, reader: Some(reader) };
+        self.state = State::Reading {
+            rx,
+            reader: Some(reader),
+        };
     }
 }
 

@@ -31,7 +31,11 @@ impl LakeFile {
         let parts = root
             .parts()
             .chain(path.split('/').filter(|p| !p.is_empty()).map(Into::into));
-        Self { store, location: Path::from_iter(parts), path: path.to_owned() }
+        Self {
+            store,
+            location: Path::from_iter(parts),
+            path: path.to_owned(),
+        }
     }
 
     /// The path relative to the lake root, as given.
@@ -40,7 +44,10 @@ impl LakeFile {
     }
 
     pub(crate) fn format(&self) -> Result<Format> {
-        let extension = self.path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+        let extension = self
+            .path
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase());
         match extension.as_deref() {
             Some("csv") => Ok(Format::Csv),
             Some("parquet") => Ok(Format::Parquet),
@@ -57,15 +64,26 @@ impl LakeFile {
     }
 
     pub(crate) async fn size(&self) -> Result<u64> {
-        let meta = self.store.head(&self.location).await.map_err(|e| self.error(e))?;
+        let meta = self
+            .store
+            .head(&self.location)
+            .await
+            .map_err(|e| self.error(e))?;
         Ok(meta.size)
     }
 
     /// The file's contents as a stream of chunks, fetched as they are read.
     pub(crate) async fn chunks(&self) -> Result<BoxStream<'static, Result<Bytes>>> {
-        let object = self.store.get(&self.location).await.map_err(|e| self.error(e))?;
+        let object = self
+            .store
+            .get(&self.location)
+            .await
+            .map_err(|e| self.error(e))?;
         let this = self.clone();
-        Ok(object.into_stream().map(move |chunk| chunk.map_err(|e| this.error(e))).boxed())
+        Ok(object
+            .into_stream()
+            .map(move |chunk| chunk.map_err(|e| this.error(e)))
+            .boxed())
     }
 
     pub(crate) async fn put(&self, contents: Vec<u8>) -> Result<()> {

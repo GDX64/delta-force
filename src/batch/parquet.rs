@@ -11,8 +11,8 @@ use delta_kernel::parquet::arrow::arrow_reader::ArrowReaderOptions;
 use delta_kernel::parquet::arrow::async_reader::AsyncFileReader;
 use delta_kernel::parquet::errors::ParquetError;
 use delta_kernel::parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
-use futures_util::future::{BoxFuture, FutureExt};
 use futures_util::StreamExt;
+use futures_util::future::{BoxFuture, FutureExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -27,7 +27,10 @@ use crate::{Error, Result};
 #[tracing::instrument(name = "open_parquet", skip_all, fields(path = file.path()))]
 pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Batches> {
     let path = file.path().to_owned();
-    let invalid = move |message: String| Error::InvalidFile { file: path.clone(), message };
+    let invalid = move |message: String| Error::InvalidFile {
+        file: path.clone(),
+        message,
+    };
     let storage = |e: ParquetError| Error::Storage(e.into());
 
     let reader = Reader {
@@ -35,7 +38,9 @@ pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Bat
         location: file.location().clone(),
         size: file.size().await?,
     };
-    let builder = ParquetRecordBatchStreamBuilder::new(reader).await.map_err(storage)?;
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(storage)?;
     let schema = builder.schema().clone();
 
     // Check the whole schema from the footer before reading any data.
@@ -62,7 +67,10 @@ pub(super) async fn read(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Bat
             let convert = |i: usize| -> Result<ArrayRef, String> {
                 let target = columns[source.iter().position(|s| *s == Some(i)).unwrap()].data_type;
                 // `safe: false`: a value that doesn't fit is an error, not a null.
-                let options = CastOptions { safe: false, ..Default::default() };
+                let options = CastOptions {
+                    safe: false,
+                    ..Default::default()
+                };
                 cast_with_options(batch.column(i), &target.to_arrow(), &options)
                     .map_err(|e| format!("column {:?}: {e}", schema.field(i).name()))
             };
@@ -84,15 +92,26 @@ fn external(e: object_store::Error) -> ParquetError {
 
 impl AsyncFileReader for Reader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
-        async move { self.store.get_range(&self.location, range).await.map_err(external) }.boxed()
+        async move {
+            self.store
+                .get_range(&self.location, range)
+                .await
+                .map_err(external)
+        }
+        .boxed()
     }
 
     fn get_byte_ranges(
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, Result<Vec<Bytes>, ParquetError>> {
-        async move { self.store.get_ranges(&self.location, &ranges).await.map_err(external) }
-            .boxed()
+        async move {
+            self.store
+                .get_ranges(&self.location, &ranges)
+                .await
+                .map_err(external)
+        }
+        .boxed()
     }
 
     /// Reads the footer with a single suffix-sized fetch where possible.
@@ -116,7 +135,10 @@ impl AsyncFileReader for Reader {
 /// Narrowing integer conversions are allowed but checked on every value.
 fn fits(found: &ArrowType, target: DataType) -> bool {
     use ArrowType::*;
-    let integer = matches!(found, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64);
+    let integer = matches!(
+        found,
+        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64
+    );
     match target {
         DataType::Boolean => matches!(found, Boolean),
         DataType::Integer | DataType::Long => integer,
@@ -133,11 +155,11 @@ fn fits(found: &ArrowType, target: DataType) -> bool {
 mod tests {
     use super::*;
     use arrow_array::RecordBatch;
-    use futures_util::TryStreamExt;
     use arrow_array::{Int64Array, StringArray};
     use delta_kernel::parquet::arrow::ArrowWriter;
-    use object_store::memory::InMemory;
+    use futures_util::TryStreamExt;
     use object_store::PutPayload;
+    use object_store::memory::InMemory;
 
     /// A one-column Parquet file named `id` in an in-memory store.
     async fn file_with_id(array: ArrayRef) -> LakeFile {
@@ -149,12 +171,20 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let file = LakeFile::new(store.clone(), &Path::default(), "f.parquet");
-        store.put(file.location(), PutPayload::from(bytes)).await.unwrap();
+        store
+            .put(file.location(), PutPayload::from(bytes))
+            .await
+            .unwrap();
         file
     }
 
     fn id(data_type: DataType) -> Arc<[Column]> {
-        vec![Column { name: "id".into(), data_type, nullable: false }].into()
+        vec![Column {
+            name: "id".into(),
+            data_type,
+            nullable: false,
+        }]
+        .into()
     }
 
     async fn read_all(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Vec<RecordBatch>> {
@@ -164,17 +194,29 @@ mod tests {
     #[tokio::test]
     async fn incompatible_types_fail_before_reading_data() {
         let file = file_with_id(Arc::new(StringArray::from(vec!["1"]))).await;
-        let error = read_all(&file, &id(DataType::Long)).await.unwrap_err().to_string();
-        assert!(error.contains("column \"id\": expected long, found Utf8"), "{error}");
+        let error = read_all(&file, &id(DataType::Long))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("column \"id\": expected long, found Utf8"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
     async fn narrowing_checks_every_value() {
         let fits = file_with_id(Arc::new(Int64Array::from(vec![1, 2]))).await;
-        assert_eq!(read_all(&fits, &id(DataType::Integer)).await.unwrap()[0].num_rows(), 2);
+        assert_eq!(
+            read_all(&fits, &id(DataType::Integer)).await.unwrap()[0].num_rows(),
+            2
+        );
 
         let overflow = file_with_id(Arc::new(Int64Array::from(vec![1, i64::MAX]))).await;
-        let error = read_all(&overflow, &id(DataType::Integer)).await.unwrap_err().to_string();
+        let error = read_all(&overflow, &id(DataType::Integer))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("f.parquet: column \"id\""), "{error}");
     }
 }

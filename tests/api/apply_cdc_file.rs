@@ -28,7 +28,9 @@ async fn apply_a_cdc_file_from_the_lake() -> anyhow::Result<()> {
     .await?;
 
     // The file is read as it is applied, in one commit, never held whole.
-    let config = ChangesConfig::new(events.schema()).key("id").operation("op");
+    let config = ChangesConfig::new(events.schema())
+        .key("id")
+        .operation("op");
     let mut changes = ChangesBatch::new(config);
     changes.push_file(&lake.file("landing/cdc.csv"));
     events.apply(changes).await?;

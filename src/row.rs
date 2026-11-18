@@ -196,7 +196,10 @@ impl Row {
 
     /// The raw value of `column`, if the row has it.
     pub fn value(&self, column: &str) -> Option<&Value> {
-        self.values.iter().find(|(c, _)| c == column).map(|(_, v)| v)
+        self.values
+            .iter()
+            .find(|(c, _)| c == column)
+            .map(|(_, v)| v)
     }
 
     /// The value of `column` as `T`. Use `Option<T>` for nullable columns.

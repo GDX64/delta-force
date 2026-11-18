@@ -59,14 +59,19 @@ impl SyncObjectStore {
     {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let fut = f(self.store.clone());
-        let rt = self.runtime.0.as_ref().expect("runtime is only taken on drop");
+        let rt = self
+            .runtime
+            .0
+            .as_ref()
+            .expect("runtime is only taken on drop");
         rt.spawn(
             async move {
                 let _ = tx.send(fut.await);
             }
             .in_current_span(),
         );
-        rx.recv().expect("object store runtime stopped unexpectedly")
+        rx.recv()
+            .expect("object store runtime stopped unexpectedly")
     }
 
     #[tracing::instrument(name = "store_get", skip_all, fields(%path))]
@@ -80,8 +85,15 @@ impl SyncObjectStore {
     #[tracing::instrument(name = "store_put", skip_all, fields(%path, bytes = data.len()))]
     pub fn put(&self, path: &Path, data: Bytes, overwrite: bool) -> Result<()> {
         let path = path.clone();
-        let mode = if overwrite { PutMode::Overwrite } else { PutMode::Create };
-        let opts = PutOptions { mode, ..Default::default() };
+        let mode = if overwrite {
+            PutMode::Overwrite
+        } else {
+            PutMode::Create
+        };
+        let opts = PutOptions {
+            mode,
+            ..Default::default()
+        };
         self.run(|s| async move { s.put_opts(&path, data.into(), opts).await })
             .map(|_| ())
     }

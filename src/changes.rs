@@ -57,7 +57,12 @@ pub struct ChangesConfig {
 impl ChangesConfig {
     /// Changes to a table with `schema`, from [`Table::schema`](crate::Table::schema).
     pub fn new(schema: Schema) -> Self {
-        Self { schema, key: None, operation: None, mode: ApplyMode::default() }
+        Self {
+            schema,
+            key: None,
+            operation: None,
+            mode: ApplyMode::default(),
+        }
     }
 
     /// The column that identifies a row.
@@ -125,7 +130,8 @@ fn key_of(row: &Row, column: &str) -> Result<Key> {
 }
 
 fn key_text(row: &Row, column: &str) -> String {
-    row.value(column).map_or_else(|| "null".into(), |v| format!("{v:?}"))
+    row.value(column)
+        .map_or_else(|| "null".into(), |v| format!("{v:?}"))
 }
 
 /// Where an existing row lives: data file index and row position in it.
@@ -160,7 +166,11 @@ impl<'a> Planner<'a> {
         let mut entries: HashMap<Key, Entry> = HashMap::new();
         for (location, row) in existing {
             let (k, text) = (key_of(&row, key)?, key_text(&row, key));
-            let entry = Entry { origin: Some(location), row: Some(row), changed: false };
+            let entry = Entry {
+                origin: Some(location),
+                row: Some(row),
+                changed: false,
+            };
             if entries.insert(k, entry).is_some() {
                 return Err(Error::DuplicateKey(text));
             }
@@ -173,10 +183,11 @@ impl<'a> Planner<'a> {
         let k = key_of(change.row(), key)?;
         match change {
             Change::Insert(row) => {
-                let entry = self
-                    .entries
-                    .entry(k)
-                    .or_insert(Entry { origin: None, row: None, changed: false });
+                let entry = self.entries.entry(k).or_insert(Entry {
+                    origin: None,
+                    row: None,
+                    changed: false,
+                });
                 if entry.row.is_some() {
                     return Err(Error::DuplicateKey(key_text(&row, key)));
                 }

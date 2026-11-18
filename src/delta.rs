@@ -14,7 +14,10 @@ use delta_kernel::{
     committer::FileSystemCommitter,
     engine::arrow_conversion::{TryFromArrow, TryIntoArrow},
     engine::arrow_data::ArrowEngineData,
-    scan::{ScanMetadata, state::{ScanFile, transform_to_logical}},
+    scan::{
+        ScanMetadata,
+        state::{ScanFile, transform_to_logical},
+    },
     schema::StructType,
     transaction::{
         BoundWriteContext, CommitResult, Transaction, UpdateTableOperation,
@@ -40,7 +43,10 @@ pub(crate) struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { compression: Compression::default(), rows_per_file: DEFAULT_ROWS_PER_FILE }
+        Self {
+            compression: Compression::default(),
+            rows_per_file: DEFAULT_ROWS_PER_FILE,
+        }
     }
 }
 
@@ -83,7 +89,9 @@ impl Append {
     /// Write `batch` as a data file of this append, uncommitted.
     #[tracing::instrument(skip_all, fields(rows = batch.num_rows()))]
     pub fn write_file(&mut self, batch: RecordBatch) -> anyhow::Result<()> {
-        let add = self.engine.write_data_file(batch, &self.context, self.compression)?;
+        let add = self
+            .engine
+            .write_data_file(batch, &self.context, self.compression)?;
         self.txn.add_files(add);
         Ok(())
     }
@@ -194,7 +202,13 @@ impl DeltaTable {
             .update_table(UpdateTableOperation::Write, ENGINE_INFO, true)
             .build(self.engine.as_ref(), Box::new(FileSystemCommitter::new()))?;
         let context = txn.write_state()?.write_context_builder().build()?;
-        Ok(Append { engine: self.engine.clone(), txn, context, compression, schema })
+        Ok(Append {
+            engine: self.engine.clone(),
+            txn,
+            context,
+            compression,
+            schema,
+        })
     }
 
     /// Merge-on-read update in one commit. `f` gets every data file's live
@@ -221,8 +235,9 @@ impl DeltaTable {
             let context = txn.write_state()?.write_context_builder().build()?;
 
             if !plan.deletes.is_empty() {
-                let _span = tracing::info_span!("write_deletion_vectors", files = plan.deletes.len())
-                    .entered();
+                let _span =
+                    tracing::info_span!("write_deletion_vectors", files = plan.deletes.len())
+                        .entered();
                 let dv_path = context.new_deletion_vector_path("dv".into());
                 let mut buffer = Vec::new();
                 let mut descriptors = HashMap::new();
@@ -257,9 +272,7 @@ impl DeltaTable {
 
     /// Every data file at the latest version with its live (not deleted) rows.
     #[tracing::instrument(skip_all, fields(files))]
-    fn live_files(
-        &self,
-    ) -> anyhow::Result<(Arc<Snapshot>, Vec<ScanMetadata>, Vec<LiveFile>)> {
+    fn live_files(&self) -> anyhow::Result<(Arc<Snapshot>, Vec<ScanMetadata>, Vec<LiveFile>)> {
         let engine = self.engine.as_ref();
         let snapshot = self.snapshot()?;
         let scan = snapshot.clone().scan_builder().build()?;
@@ -268,7 +281,8 @@ impl DeltaTable {
         tracing::Span::current().record("files", metadata.len());
         let mut scan_files = Vec::new();
         for m in &metadata {
-            scan_files = m.visit_scan_files(scan_files, |acc: &mut Vec<ScanFile>, f| acc.push(f))?;
+            scan_files =
+                m.visit_scan_files(scan_files, |acc: &mut Vec<ScanFile>, f| acc.push(f))?;
         }
 
         let physical = scan.physical_schema().clone();
@@ -289,9 +303,10 @@ impl DeltaTable {
             let mut positions = Vec::new();
             let mut data = Vec::new();
             let mut next = 0u64;
-            for chunk in engine
-                .parquet_handler()
-                .read_parquet_files(&[meta], physical.clone(), None)?
+            for chunk in
+                engine
+                    .parquet_handler()
+                    .read_parquet_files(&[meta], physical.clone(), None)?
             {
                 let chunk = transform_to_logical(
                     engine,
@@ -303,12 +318,18 @@ impl DeltaTable {
                 let batch = RecordBatch::from(ArrowEngineData::try_from_engine_data(chunk)?);
                 let start = next;
                 next += batch.num_rows() as u64;
-                let keep: BooleanArray =
-                    (start..next).map(|p| Some(!deleted_set.contains(&p))).collect();
+                let keep: BooleanArray = (start..next)
+                    .map(|p| Some(!deleted_set.contains(&p)))
+                    .collect();
                 positions.extend((start..next).filter(|p| !deleted_set.contains(p)));
                 data.push(filter_record_batch(&batch, &keep)?);
             }
-            files.push(LiveFile { path: file.path, positions, data, deleted });
+            files.push(LiveFile {
+                path: file.path,
+                positions,
+                data,
+                deleted,
+            });
         }
         Ok((snapshot, metadata, files))
     }
@@ -487,7 +508,15 @@ mod tests {
         for compression in [Compression::Snappy, Compression::Zstd] {
             let path = dir.path().join(compression.to_string());
             let table = local(&path);
-            table.create(&id_schema(), Settings { compression, ..Default::default() }).unwrap();
+            table
+                .create(
+                    &id_schema(),
+                    Settings {
+                        compression,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             table.write(ids(vec![1, 2, 3])).unwrap();
 
             assert_eq!(table.compression().unwrap(), compression);

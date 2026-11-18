@@ -1,5 +1,7 @@
 use delta_force::object_store::memory::InMemory;
-use delta_force::{Change, ChangesBatch, ChangesConfig, DataType, Lake, RowBatch, TableConfig, row};
+use delta_force::{
+    Change, ChangesBatch, ChangesConfig, DataType, Lake, RowBatch, TableConfig, row,
+};
 
 #[tokio::test]
 async fn apply_inserts_updates_and_deletes() -> anyhow::Result<()> {

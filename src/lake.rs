@@ -8,8 +8,8 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
 use delta_kernel::arrow::compute::concat_batches;
 use futures_util::StreamExt;
-use tracing::Instrument;
 use object_store::ObjectStore;
+use tracing::Instrument;
 use url::Url;
 
 use crate::batch::{ChangesBatch, RowBatch, split_rows};
@@ -194,7 +194,11 @@ impl Lake {
     /// A file in the lake, by its path relative to the lake root (for
     /// example `"landing/events.csv"`). Nothing is read until it is used.
     pub fn file(&self, path: &str) -> LakeFile {
-        LakeFile::new(self.store.clone(), &object_store::path::Path::default(), path)
+        LakeFile::new(
+            self.store.clone(),
+            &object_store::path::Path::default(),
+            path,
+        )
     }
 
     /// Store `contents` as a file in the lake, replacing any existing one.
@@ -334,7 +338,11 @@ impl Table {
         .await?;
         let mut rows = batch.into_stream();
         let (mut pending, mut files, mut total) = (Vec::new(), 0, 0);
-        while let Some(batch) = rows.next().instrument(tracing::trace_span!("next_batch")).await {
+        while let Some(batch) = rows
+            .next()
+            .instrument(tracing::trace_span!("next_batch"))
+            .await
+        {
             let batch = batch?;
             total += batch.num_rows();
             pending.push(batch);
@@ -349,7 +357,9 @@ impl Table {
             append = write_file(append, pending).await?;
             files += 1;
         }
-        tracing::Span::current().record("files", files).record("rows", total);
+        tracing::Span::current()
+            .record("files", files)
+            .record("rows", total);
         if files == 0 {
             return Err(Error::NoRows);
         }
@@ -379,7 +389,8 @@ impl Table {
             schema.check(&table_columns(&inner.arrow_schema()?)?)?;
             let mut applied = Applied::default();
             applied.version = inner.merge(|files| {
-                let plan_span = tracing::info_span!("plan_merge", changes = tracing::field::Empty).entered();
+                let plan_span =
+                    tracing::info_span!("plan_merge", changes = tracing::field::Empty).entered();
                 let index_span = tracing::info_span!("index_existing_rows").entered();
                 let mut existing = Vec::new();
                 for (index, file) in files.iter().enumerate() {
@@ -398,7 +409,8 @@ impl Table {
                         .in_scope(|| runtime.block_on(changes.next()));
                     let Some(chunk) = next else { break };
                     let chunk = chunk?;
-                    let _span = tracing::trace_span!("plan_changes", changes = chunk.len()).entered();
+                    let _span =
+                        tracing::trace_span!("plan_changes", changes = chunk.len()).entered();
                     for change in chunk {
                         planner.apply(change)?;
                         applied.changes += 1;
@@ -408,10 +420,15 @@ impl Table {
                 let plan = planner.finish();
                 let mut merge = MergePlan::default();
                 for (index, position) in plan.delete {
-                    merge.deletes.entry(files[index].path.clone()).or_default().push(position);
+                    merge
+                        .deletes
+                        .entry(files[index].path.clone())
+                        .or_default()
+                        .push(position);
                 }
                 if !plan.append.is_empty() {
-                    let _span = tracing::info_span!("build_append", rows = plan.append.len()).entered();
+                    let _span =
+                        tracing::info_span!("build_append", rows = plan.append.len()).entered();
                     let mut rows = RowBatch::new(schema.clone());
                     for row in plan.append {
                         rows.push(row)?;
@@ -682,14 +699,20 @@ mod tests {
             .nullable("score", DataType::Double);
         let table = lake.create(config).await.unwrap();
         let mut batch = RowBatch::new(table.schema());
-        batch.push(crate::row! { "id" => 1, "name" => "a", "score" => 0.5 }).unwrap();
-        batch.push(crate::row! { "id" => 2, "name" => "b", "score" => 0.5 }).unwrap();
+        batch
+            .push(crate::row! { "id" => 1, "name" => "a", "score" => 0.5 })
+            .unwrap();
+        batch
+            .push(crate::row! { "id" => 2, "name" => "b", "score" => 0.5 })
+            .unwrap();
         table.write(batch).await.unwrap();
         table
     }
 
     fn cdc_config(table: &Table) -> crate::ChangesConfig {
-        crate::ChangesConfig::new(table.schema()).key("id").operation("op")
+        crate::ChangesConfig::new(table.schema())
+            .key("id")
+            .operation("op")
     }
 
     async fn apply_file(lake: &Lake, table: &Table, csv: &str) -> Result<Applied> {
@@ -704,15 +727,27 @@ mod tests {
         use crate::{Change, row};
         let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
-        lake.put_file("cdc.csv", "op,id,name\nupdate,3,c2\nDELETE,1,\n").await.unwrap();
+        lake.put_file("cdc.csv", "op,id,name\nupdate,3,c2\nDELETE,1,\n")
+            .await
+            .unwrap();
 
         let mut changes = ChangesBatch::new(cdc_config(&table));
-        changes.push(Change::insert(row! { "id" => 3, "name" => "c" })).unwrap();
+        changes
+            .push(Change::insert(row! { "id" => 3, "name" => "c" }))
+            .unwrap();
         changes.push_file(&lake.file("cdc.csv"));
-        changes.push(Change::insert(row! { "id" => 1, "name" => "a2" })).unwrap();
+        changes
+            .push(Change::insert(row! { "id" => 1, "name" => "a2" }))
+            .unwrap();
         let applied = table.apply(changes).await.unwrap();
 
-        assert_eq!(applied, Applied { changes: 4, version: Some(2) });
+        assert_eq!(
+            applied,
+            Applied {
+                changes: 4,
+                version: Some(2)
+            }
+        );
         assert_eq!(
             table.rows().await.unwrap().sorted_by("id"),
             [
@@ -728,7 +763,13 @@ mod tests {
         let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         let applied = apply_file(&lake, &table, "op,id\nD,9\n").await.unwrap();
-        assert_eq!(applied, Applied { changes: 1, version: None });
+        assert_eq!(
+            applied,
+            Applied {
+                changes: 1,
+                version: None
+            }
+        );
         let empty = ChangesBatch::new(cdc_config(&table));
         assert_eq!(table.apply(empty).await.unwrap(), Applied::default());
         assert_eq!(table.version().await.unwrap(), 1);
@@ -739,12 +780,24 @@ mod tests {
         let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
         // No `score` column: scores are kept. An empty name would be null.
-        apply_file(&lake, &table, "op,id,name\nU,1,z\n").await.unwrap();
+        apply_file(&lake, &table, "op,id,name\nU,1,z\n")
+            .await
+            .unwrap();
         let rows = table.rows().await.unwrap().sorted_by("id");
-        assert_eq!(rows.to_vec()[0], crate::row! { "id" => 1, "name" => "z", "score" => 0.5 });
+        assert_eq!(
+            rows.to_vec()[0],
+            crate::row! { "id" => 1, "name" => "z", "score" => 0.5 }
+        );
 
-        let error = apply_file(&lake, &table, "op,id,name\nU,1,\n").await.unwrap_err();
-        assert!(error.to_string().contains("row 1: column \"name\" is not nullable"), "{error}");
+        let error = apply_file(&lake, &table, "op,id,name\nU,1,\n")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("row 1: column \"name\" is not nullable"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -753,16 +806,30 @@ mod tests {
         let table = cdc_table(&lake).await;
         let error = |csv: &'static str| {
             let (lake, table) = (lake.clone(), table.clone());
-            async move { apply_file(&lake, &table, csv).await.unwrap_err().to_string() }
+            async move {
+                apply_file(&lake, &table, csv)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+            }
         };
         let unknown = error("op,id,name\ni,3,c\nupsert,4,d\n").await;
-        assert!(unknown.contains("cdc.csv: row 2: unknown operation \"upsert\""), "{unknown}");
+        assert!(
+            unknown.contains("cdc.csv: row 2: unknown operation \"upsert\""),
+            "{unknown}"
+        );
         let incomplete = error("op,id\ni,3\n").await;
-        assert!(incomplete.contains("row 1: column \"name\" is not nullable"), "{incomplete}");
+        assert!(
+            incomplete.contains("row 1: column \"name\" is not nullable"),
+            "{incomplete}"
+        );
         let no_key = error("op,id,name\nd,,\n").await;
         assert!(no_key.contains("row 1: column \"id\""), "{no_key}");
         let no_op = error("id,name\n3,c\n").await;
-        assert!(no_op.contains("required column \"op\" is missing"), "{no_op}");
+        assert!(
+            no_op.contains("required column \"op\" is missing"),
+            "{no_op}"
+        );
         assert_eq!(table.version().await.unwrap(), 1);
     }
 
@@ -772,7 +839,9 @@ mod tests {
         let table = cdc_table(&lake).await;
         let changes = |config: crate::ChangesConfig| {
             let mut changes = ChangesBatch::new(config.key("id"));
-            changes.push(crate::Change::delete(crate::row! { "id" => 1 })).unwrap();
+            changes
+                .push(crate::Change::delete(crate::row! { "id" => 1 }))
+                .unwrap();
             changes.push_file(&lake.file("never-read.csv"));
             changes
         };
@@ -793,15 +862,21 @@ mod tests {
         let table = cdc_table(&lake).await;
 
         let mut changes = ChangesBatch::new(ChangesConfig::new(table.schema()));
-        let error = changes.push(Change::delete(row! { "id" => 1 })).unwrap_err();
+        let error = changes
+            .push(Change::delete(row! { "id" => 1 }))
+            .unwrap_err();
         assert!(matches!(error, Error::InvalidConfig(_)), "{error}");
 
         let mut changes = ChangesBatch::new(ChangesConfig::new(table.schema()).key("nope"));
-        let error = changes.push(Change::delete(row! { "id" => 1 })).unwrap_err();
+        let error = changes
+            .push(Change::delete(row! { "id" => 1 }))
+            .unwrap_err();
         assert!(matches!(error, Error::ColumnNotFound(_)), "{error}");
 
         let mut changes = ChangesBatch::new(ChangesConfig::new(table.schema()).key("id"));
-        let error = changes.push(Change::update(row! { "name" => "x" })).unwrap_err();
+        let error = changes
+            .push(Change::update(row! { "name" => "x" }))
+            .unwrap_err();
         assert!(matches!(error, Error::MissingValue(_)), "{error}");
         assert!(changes.is_empty());
     }
@@ -818,11 +893,17 @@ mod tests {
 
         let mut rows = RowBatch::new(other.schema());
         rows.push(row! { "id" => 3 }).unwrap();
-        assert!(matches!(table.write(rows).await, Err(Error::SchemaMismatch)));
+        assert!(matches!(
+            table.write(rows).await,
+            Err(Error::SchemaMismatch)
+        ));
 
         let mut changes = ChangesBatch::new(ChangesConfig::new(other.schema()).key("id"));
         changes.push(Change::delete(row! { "id" => 1 })).unwrap();
-        assert!(matches!(table.apply(changes).await, Err(Error::SchemaMismatch)));
+        assert!(matches!(
+            table.apply(changes).await,
+            Err(Error::SchemaMismatch)
+        ));
         assert_eq!(table.version().await.unwrap(), 1);
     }
 
@@ -830,10 +911,16 @@ mod tests {
     async fn change_files_stream_on_a_multi_threaded_runtime() {
         let lake = Lake::new(InMemory::new());
         let table = cdc_table(&lake).await;
-        let applied = apply_file(&lake, &table, "op,id,name
+        let applied = apply_file(
+            &lake,
+            &table,
+            "op,id,name
 d,1,
 d,2,
-").await.unwrap();
+",
+        )
+        .await
+        .unwrap();
         assert_eq!(applied.changes, 2);
         assert!(table.rows().await.unwrap().is_empty());
     }

@@ -8,12 +8,12 @@ use arrow_array::{ArrayRef, RecordBatch};
 use futures_util::stream::{self, BoxStream};
 use futures_util::{StreamExt, TryStreamExt};
 
-use crate::file::{Format, LakeFile};
-use crate::lake::{Column, DataType, arrow_schema, batch_rows, value_at};
-use columns::complete;
 use crate::changes::check_key;
+use crate::file::{Format, LakeFile};
 use crate::lake::Schema;
+use crate::lake::{Column, DataType, arrow_schema, batch_rows, value_at};
 use crate::{Change, ChangesConfig, Error, Result, Row, Value};
+use columns::complete;
 
 mod columns;
 mod csv;
@@ -40,7 +40,10 @@ impl RowBatch {
     /// [`RowBatch::push`] or [`RowBatch::push_file`], then hand it to
     /// [`Table::write`](crate::Table::write).
     pub fn new(schema: Schema) -> Self {
-        Self { builders: Builders::new(schema.columns().clone()), files: Vec::new() }
+        Self {
+            builders: Builders::new(schema.columns().clone()),
+            files: Vec::new(),
+        }
     }
 
     pub(crate) fn schema(&self) -> Schema {
@@ -103,7 +106,10 @@ async fn read_file(file: &LakeFile, columns: &Arc<[Column]>) -> Result<Batches> 
 }
 
 /// The first `n` rows of `batches`, and the rest. Slicing copies no data.
-pub(crate) fn split_rows(batches: &[RecordBatch], n: usize) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
+pub(crate) fn split_rows(
+    batches: &[RecordBatch],
+    n: usize,
+) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
     let (mut head, mut tail) = (Vec::new(), Vec::new());
     let mut left = n;
     for batch in batches {
@@ -160,7 +166,8 @@ impl Kind {
     /// or their initials, ignoring case.
     fn parse(name: &str) -> Option<Self> {
         let name = name.trim();
-        let is = |full: &str| name.eq_ignore_ascii_case(full) || name.eq_ignore_ascii_case(&full[..1]);
+        let is =
+            |full: &str| name.eq_ignore_ascii_case(full) || name.eq_ignore_ascii_case(&full[..1]);
         if is("insert") {
             Some(Kind::Insert)
         } else if is("update") {
@@ -186,7 +193,11 @@ pub(crate) type ChangeStream = BoxStream<'static, Result<Vec<Change>>>;
 
 impl ChangesBatch {
     pub fn new(config: ChangesConfig) -> Self {
-        Self { config, parts: Vec::new(), len: 0 }
+        Self {
+            config,
+            parts: Vec::new(),
+            len: 0,
+        }
     }
 
     /// Add a change. Every change needs the key; an insert needs every
@@ -208,7 +219,9 @@ impl ChangesBatch {
                 present: Vec::new(),
             }));
         }
-        let Some(Part::Pushed(pushed)) = self.parts.last_mut() else { unreachable!() };
+        let Some(Part::Pushed(pushed)) = self.parts.last_mut() else {
+            unreachable!()
+        };
         if let Err(e) = pushed.builders.check(row, kind == Kind::Insert) {
             if pushed.kinds.is_empty() {
                 self.parts.pop();
@@ -268,9 +281,10 @@ impl ChangesBatch {
                     "change files need an operation column (ChangesConfig::operation)".into(),
                 ));
             }
-            (true, Some(operation)) => {
-                Some((change_file_columns(&columns, operation)?, operation.to_owned()))
-            }
+            (true, Some(operation)) => Some((
+                change_file_columns(&columns, operation)?,
+                operation.to_owned(),
+            )),
         };
         let parts = self.parts.into_iter().map(move |part| match part {
             Part::Pushed(pushed) => stream::once(async move { pushed.into_changes() }).boxed(),
@@ -294,7 +308,10 @@ impl Pushed {
             let mut row = Row::new();
             for (c, column) in columns.iter().enumerate() {
                 if self.present[i * columns.len() + c] {
-                    row.set(column.name.clone(), value_at(data.column(c), i, &column.name)?);
+                    row.set(
+                        column.name.clone(),
+                        value_at(data.column(c), i, &column.name)?,
+                    );
                 }
             }
             changes.push(kind.change(row));
@@ -306,13 +323,26 @@ impl Pushed {
 /// The columns to read a change file with: every table column, nullable
 /// (a delete only carries the key), then the operation column.
 fn change_file_columns(columns: &[Column], operation: &str) -> Result<Arc<[Column]>> {
-    if columns.iter().any(|c| c.name.eq_ignore_ascii_case(operation)) {
+    if columns
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(operation))
+    {
         return Err(Error::InvalidConfig(format!(
             "operation column {operation:?} is also a table column"
         )));
     }
-    let mut read: Vec<Column> = columns.iter().map(|c| Column { nullable: true, ..c.clone() }).collect();
-    read.push(Column { name: operation.to_owned(), data_type: DataType::String, nullable: false });
+    let mut read: Vec<Column> = columns
+        .iter()
+        .map(|c| Column {
+            nullable: true,
+            ..c.clone()
+        })
+        .collect();
+    read.push(Column {
+        name: operation.to_owned(),
+        data_type: DataType::String,
+        nullable: false,
+    });
     Ok(read.into())
 }
 
@@ -329,7 +359,13 @@ struct FileChanges {
 
 impl FileChanges {
     fn new(file: LakeFile, columns: Arc<[Column]>, key: String, operation: String) -> Self {
-        Self { file, builders: Builders::new(columns), key, operation, rows: 0 }
+        Self {
+            file,
+            builders: Builders::new(columns),
+            key,
+            operation,
+            rows: 0,
+        }
     }
 
     /// The file's changes, read with the `read` columns as they are pulled.
@@ -360,14 +396,17 @@ impl FileChanges {
             Some(Value::String(name)) => name,
             _ => unreachable!("the operation column is required and a string"),
         };
-        let kind = Kind::parse(&operation)
-            .ok_or_else(|| format!("unknown operation {operation:?} (expected insert, update or delete)"))?;
+        let kind = Kind::parse(&operation).ok_or_else(|| {
+            format!("unknown operation {operation:?} (expected insert, update or delete)")
+        })?;
         check_key(&row, &self.key).map_err(|e| e.to_string())?;
         if kind == Kind::Delete {
             let key = row.take(&self.key).unwrap_or(Value::Null);
             row = Row::new().with(self.key.clone(), key);
         }
-        self.builders.check(row.clone(), kind == Kind::Insert).map_err(|e| e.to_string())?;
+        self.builders
+            .check(row.clone(), kind == Kind::Insert)
+            .map_err(|e| e.to_string())?;
         Ok(kind.change(row))
     }
 }
@@ -385,8 +424,17 @@ struct Builders {
 
 impl Builders {
     fn new(columns: Arc<[Column]>) -> Self {
-        let builders = columns.iter().map(|c| ColumnBuilder::new(c.data_type)).collect();
-        Self { columns, builders, len: 0, scratch: Vec::new(), present: Vec::new() }
+        let builders = columns
+            .iter()
+            .map(|c| ColumnBuilder::new(c.data_type))
+            .collect();
+        Self {
+            columns,
+            builders,
+            len: 0,
+            scratch: Vec::new(),
+            present: Vec::new(),
+        }
     }
 
     /// Check `row` against the columns without appending anything. With
@@ -426,7 +474,11 @@ impl Builders {
     }
 
     fn finish(self) -> Result<RecordBatch> {
-        let arrays: Vec<ArrayRef> = self.builders.into_iter().map(ColumnBuilder::finish).collect();
+        let arrays: Vec<ArrayRef> = self
+            .builders
+            .into_iter()
+            .map(ColumnBuilder::finish)
+            .collect();
         RecordBatch::try_new(Arc::new(arrow_schema(&self.columns)), arrays)
             .map_err(|e| Error::Storage(e.into()))
     }

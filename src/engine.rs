@@ -43,8 +43,8 @@ use delta_kernel::{
 use delta_kernel_default_engine::{
     build_add_file_metadata, parquet::DataFileMetadata, stats::collect_stats,
 };
-use object_store::path::Path;
 use object_store::ObjectStore;
+use object_store::path::Path;
 use url::Url;
 
 use crate::compression::Compression;
@@ -152,7 +152,9 @@ fn store_error(url: &Url, e: object_store::Error) -> KernelError {
 }
 
 fn get(store: &SyncObjectStore, url: &Url) -> KernelResult<Bytes> {
-    store.get(&object_path(url)?).map_err(|e| store_error(url, e))
+    store
+        .get(&object_path(url)?)
+        .map_err(|e| store_error(url, e))
 }
 
 /// With `overwrite = false` this is the atomic "create if absent" that makes
@@ -164,7 +166,9 @@ fn put(store: &SyncObjectStore, url: &Url, data: Bytes, overwrite: bool) -> Kern
 }
 
 fn head(store: &SyncObjectStore, url: &Url) -> KernelResult<FileMeta> {
-    let meta = store.head(&object_path(url)?).map_err(|e| store_error(url, e))?;
+    let meta = store
+        .head(&object_path(url)?)
+        .map_err(|e| store_error(url, e))?;
     Ok(FileMeta {
         location: url.clone(),
         last_modified: meta.last_modified.timestamp_millis(),
@@ -188,7 +192,13 @@ impl StorageHandler for StoreStorage {
         } else {
             let start = full.filename().unwrap_or_default().to_string();
             let parts: Vec<_> = full.parts().collect();
-            (parts[..parts.len().saturating_sub(1)].iter().cloned().collect(), start)
+            (
+                parts[..parts.len().saturating_sub(1)]
+                    .iter()
+                    .cloned()
+                    .collect(),
+                start,
+            )
         };
         // Non-recursive: only the files directly inside `dir`.
         let listing = self
