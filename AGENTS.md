@@ -61,7 +61,7 @@ while let Some(rows) = stream.next().await? { /* row.get::<i64>("id")? */ }
   `apply` fail with `SchemaMismatch` if it isn't the table's current one.
 - Traced with `tracing` spans (the kernel's show up too); the library never
   installs a subscriber. Spans follow work across thread hops: `blocking`,
-  `SyncObjectStore::run` and the file readers carry the caller's span over.
+  `SyncObjectStore::run` and `RowStream`'s reader carry the caller's span over.
   Per-batch spans are `trace` level, the rest `info`.
 - `ChangesBatch` keeps pushed changes and CDC files in push order. `apply`
   pulls its change stream from inside the merge's blocking thread
